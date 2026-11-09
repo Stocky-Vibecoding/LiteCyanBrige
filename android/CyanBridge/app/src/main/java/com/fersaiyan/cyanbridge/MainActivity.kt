@@ -284,6 +284,22 @@ import kotlinx.coroutines.flow.merge
 
 
 class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
+    private val openMetaManager by lazy {
+        OpenMetaManager(
+            activity = this,
+            onSyncClick = { handleDashboardAction(GlassesDashboardAction.StartSync) },
+            onScanClick = { handleDashboardAction(GlassesDashboardAction.Scan) },
+            onPhotoClick = { handleDashboardAction(GlassesDashboardAction.CapturePhoto) },
+            onVideoClick = { handleDashboardAction(GlassesDashboardAction.ToggleVideo) },
+            onVisionPhotoRequest = {
+                handleGlassesImageButtonPressed(
+                    triggerCapture = true,
+                    sourceTag = "openmeta_ru_vision",
+                    offerSpokenQuestion = false
+                )
+            }
+        )
+    }
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private val localSpeechSessionManager by lazy {
@@ -797,6 +813,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         maybeStartMetaImageQuestion(intent)
 
         BatteryOptimizationGuideActivity.launchIfNeeded(this)
+        openMetaManager.attachRussianMetaUi()
     }
 
     override fun onStart() {
@@ -5222,6 +5239,42 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         source: ImageQuestionSource,
         transferDurationMs: Long,
     ) {
+        if (openMetaManager.geminiApiKey.isNotBlank()) {
+            val imgFile = File(imagePath)
+            if (imgFile.exists() && imgFile.length() > 0L) {
+                CoroutineScope(Dispatchers.IO).launch {
+                    try {
+                        val b64 = android.util.Base64.encodeToString(imgFile.readBytes(), android.util.Base64.NO_WRAP)
+                        val parts = org.json.JSONArray().apply {
+                            put(org.json.JSONObject().put("text", "Ты голосовой ассистент в умных очках. Коротко (1-2 предложения) на русском языке опиши, что перед пользователем на этом кадре, или прочитай текст, без спецсимволов."))
+                            put(org.json.JSONObject().put("inline_data", org.json.JSONObject().put("mime_type", "image/jpeg").put("data", b64)))
+                        }
+                        val payload = org.json.JSONObject().put("contents", org.json.JSONArray().put(org.json.JSONObject().put("parts", parts))).toString()
+                        val conn = (URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${openMetaManager.geminiApiKey}").openConnection() as HttpURLConnection).apply {
+                            requestMethod = "POST"
+                            connectTimeout = 15000
+                            readTimeout = 20000
+                            doOutput = true
+                            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                        }
+                        conn.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
+                        val resp = conn.inputStream.bufferedReader().use { it.readText() }
+                        conn.disconnect()
+                        val answer = org.json.JSONObject(resp).getJSONArray("candidates").getJSONObject(0).getJSONObject("content").getJSONArray("parts").getJSONObject(0).getString("text").replace("*", "").trim()
+                        withContext(Dispatchers.Main) {
+                            openMetaManager.speakRussian(answer)
+                            finishAiQuestionForegroundWork()
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            openMetaManager.speakRussian("Не удалось распознать кадр")
+                            finishAiQuestionForegroundWork()
+                        }
+                    }
+                }
+                return
+            }
+        }
         val imageFile = File(imagePath)
         val metrics = readImageQuestionMetrics(imageFile)
         if (metrics == null) {
@@ -7365,6 +7418,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private fun updateBatteryText(battery: Int?) {
         binding.batteryText.text = battery?.let { "$it%" } ?: "--%"
         updateDashboardState { state -> state.copy(batteryPercent = battery) }
+        openMetaManager.updateStatusUi(BleOperateManager.getInstance().isConnected, battery)
     }
 
     private fun requestBatteryStatus(showToast: Boolean) {
@@ -10143,8 +10197,28 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         contentLength: Long = -1L,
     ): GallerySaveResult {
         return try {
-            val resolver = contentResolver
+            val rawTemp = File(cacheDir, "dl_raw_${System.currentTimeMillis()}_$displayName")
+            var rawBytes = 0L
+            FileOutputStream(rawTemp).use { out ->
+                val buffer = ByteArray(8 * 1024)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    out.write(buffer, 0, read)
+                    rawBytes += read
+                }
+            }
+            if (rawBytes <= 0L || (contentLength >= 0L && rawBytes != contentLength)) {
+                rawTemp.delete()
+                return GallerySaveResult(false, null, rawBytes)
+            }
 
+            val processedFile = rawTemp.inputStream().use {
+                openMetaManager.processPhotoStream(it, displayName)
+            }
+            rawTemp.delete()
+
+            val resolver = contentResolver
             val values = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
                 put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
@@ -10158,52 +10232,22 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
 
             val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-                ?: return GallerySaveResult(false, null, 0)
+                ?: return GallerySaveResult(false, null, 0).also { processedFile.delete() }
 
-            var bytes = 0L
-            try {
-                resolver.openOutputStream(uri, "w")?.use { out ->
-                    val buffer = ByteArray(8 * 1024)
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read <= 0) break
-                        out.write(buffer, 0, read)
-                        bytes += read
-                    }
-                    out.flush()
-                } ?: run {
-                    resolver.delete(uri, null, null)
-                    return GallerySaveResult(false, null, bytes)
+            var writtenBytes = 0L
+            resolver.openOutputStream(uri, "w")?.use { out ->
+                processedFile.inputStream().use { procIn ->
+                    writtenBytes = procIn.copyTo(out)
                 }
-
-                if (bytes <= 0L || (contentLength >= 0L && bytes != contentLength)) {
-                    resolver.delete(uri, null, null)
-                    Log.w(
-                        "DataDownload",
-                        "Rejecting incomplete JPEG $displayName: bytes=$bytes expected=$contentLength",
-                    )
-                    return GallerySaveResult(false, uri.toString(), bytes)
-                }
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    val done = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
-                    resolver.update(uri, done, null, null)
-                } else {
-                    // Pre-Android 10: some galleries need an explicit media scan.
-                    MediaScannerConnection.scanFile(
-                        this,
-                        arrayOf(uri.toString()),
-                        arrayOf("image/jpeg"),
-                        null
-                    )
-                }
-
-                GallerySaveResult(true, uri.toString(), bytes)
-            } catch (e: Exception) {
-                resolver.delete(uri, null, null)
-                Log.e("DataDownload", "Gallery write failed for $displayName: ${e.message}", e)
-                GallerySaveResult(false, uri.toString(), bytes)
+                out.flush()
             }
+            processedFile.delete()
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val done = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
+                resolver.update(uri, done, null, null)
+            }
+            GallerySaveResult(true, uri.toString(), writtenBytes)
         } catch (e: Exception) {
             Log.e("DataDownload", "saveJpegToGallery failed for $displayName: ${e.message}", e)
             GallerySaveResult(false, null, 0)
@@ -10218,8 +10262,33 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         onBytesCopied: ((Long, Long) -> Unit)? = null,
     ): GallerySaveResult {
         return try {
-            val resolver = contentResolver
+            val rawTemp = File(cacheDir, "dl_raw_${System.currentTimeMillis()}_$displayName")
+            var rawBytes = 0L
+            FileOutputStream(rawTemp).use { out ->
+                val buffer = ByteArray(128 * 1024)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    out.write(buffer, 0, read)
+                    rawBytes += read
+                    onBytesCopied?.invoke(rawBytes, contentLength)
+                }
+            }
+            if (rawBytes <= 0L || (contentLength >= 0L && rawBytes != contentLength)) {
+                rawTemp.delete()
+                return GallerySaveResult(false, null, rawBytes)
+            }
 
+            // Прогоняем скачанный MP4 через выбранный режим (Исходник / Meta 2K / Горизонт Lock 2K)
+            val finalVideoFile = kotlinx.coroutines.runBlocking {
+                openMetaManager.processVideoFile(rawTemp)
+            }
+            if (finalVideoFile != rawTemp) rawTemp.
+
+
+delete()
+
+            val resolver = contentResolver
             val values = ContentValues().apply {
                 put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
                 put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
@@ -10227,52 +10296,28 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 put(MediaStore.Video.Media.DATE_ADDED, takenTimeMs / 1000)
                 put(MediaStore.Video.Media.DATE_MODIFIED, takenTimeMs / 1000)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    // Keep videos in the same DCIM/CyanBridge folder as photos.
                     put(MediaStore.Video.Media.RELATIVE_PATH, SyncedMediaFolder.relativePath)
                     put(MediaStore.Video.Media.IS_PENDING, 1)
                 }
             }
 
             val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-                ?: return GallerySaveResult(false, null, 0)
+                ?: return GallerySaveResult(false, null, 0).also { finalVideoFile.delete() }
 
-            var bytes = 0L
-            try {
-                resolver.openOutputStream(uri, "w")?.use { out ->
-                    val buffer = ByteArray(128 * 1024)
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read <= 0) break
-                        out.write(buffer, 0, read)
-                        bytes += read
-                        onBytesCopied?.invoke(bytes, contentLength)
-                    }
-                    out.flush()
-                } ?: run {
-                    resolver.delete(uri, null, null)
-                    return GallerySaveResult(false, null, bytes)
+            var writtenBytes = 0L
+            resolver.openOutputStream(uri, "w")?.use { out ->
+                finalVideoFile.inputStream().use { procIn ->
+                    writtenBytes = procIn.copyTo(out)
                 }
-
-                if (bytes <= 0L || (contentLength >= 0L && bytes != contentLength)) {
-                    resolver.delete(uri, null, null)
-                    Log.w(
-                        "DataDownload",
-                        "Rejecting incomplete MP4 $displayName: bytes=$bytes expected=$contentLength",
-                    )
-                    return GallerySaveResult(false, uri.toString(), bytes)
-                }
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    val done = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
-                    resolver.update(uri, done, null, null)
-                }
-
-                GallerySaveResult(true, uri.toString(), bytes)
-            } catch (e: Exception) {
-                resolver.delete(uri, null, null)
-                Log.e("DataDownload", "Gallery video write failed for $displayName: ${e.message}", e)
-                GallerySaveResult(false, uri.toString(), bytes)
+                out.flush()
             }
+            finalVideoFile.delete()
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val done = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+                resolver.update(uri, done, null, null)
+            }
+            GallerySaveResult(true, uri.toString(), writtenBytes)
         } catch (e: Exception) {
             Log.e("DataDownload", "saveMp4ToGallery failed for $displayName: ${e.message}", e)
             GallerySaveResult(false, null, 0)
@@ -11983,7 +12028,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     if (response.loadData.size > 7 && response.loadData[7].toInt() == 1) {
                         Log.i("DeviceNotify", "AI Button Pressed - Hijacking to Phone Assistant")
                         if (isAiHijackEnabled) {
-                            handleAiWakeWordActivation("heycyan")
+                            openMetaManager.onTouchpadLongHold()
                         } else {
                             //The glasses activate the microphone to start speaking
                             runOnUiThread {
