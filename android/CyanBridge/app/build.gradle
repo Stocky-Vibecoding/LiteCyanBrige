@@ -228,7 +228,9 @@ dependencies {
 
     // LiteRT-LM local multimodal/chat runtime.
     implementation("com.google.ai.edge.litertlm:litertlm-android:0.16.0")
-
+    implementation("androidx.media3:media3-transformer:1.4.1")
+    implementation("androidx.media3:media3-effect:1.4.1")
+    implementation("androidx.media3:media3-common:1.4.1")
     // Walking Aid uses the Interpreter API retained by LiteRT. These artifacts package
     // flexible-page-size native libraries for Android 15+ 16 KB devices.
     implementation("com.google.ai.edge.litert:litert:1.4.2")
