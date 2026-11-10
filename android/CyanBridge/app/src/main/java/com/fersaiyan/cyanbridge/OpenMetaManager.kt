@@ -2,8 +2,11 @@ package com.fersaiyan.cyanbridge
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.content.ContentUris
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -16,11 +19,16 @@ import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioManager
 import android.media.MediaMetadataRetriever
+import android.media.ToneGenerator
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import android.net.Uri
 import android.opengl.GLES20
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.provider.MediaStore
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -30,8 +38,10 @@ import android.util.Base64
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -59,10 +69,15 @@ import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.Transformer
 import androidx.media3.transformer.VideoEncoderSettings
+import com.fersaiyan.cyanbridge.devices.tunebuds.TuneBudsManager
+import com.fersaiyan.cyanbridge.glasses.GlassesSessionCoordinator
+import com.fersaiyan.cyanbridge.media.SyncedMediaFolder
+import com.fersaiyan.cyanbridge.ui.recordings.RecordingsListActivity
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -72,7 +87,10 @@ import java.io.FileOutputStream
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -84,7 +102,7 @@ enum class OpenMetaRenderMode(val id: Int, val title: String, val subtitle: Stri
     RAW_ORIGINAL(
         0,
         "Исходник 1600×1200",
-        "Без обработки: прямое скачивание с очков как есть"
+        "Без обработки: быстрое сохранение с очков как есть"
     ),
     META_FAST_2K(
         1,
@@ -117,14 +135,31 @@ class OpenMetaManager(
 
     private var tts: TextToSpeech? = null
     private var speechRecognizer: SpeechRecognizer? = null
+    private var mediaSession: MediaSession? = null
+    private var lastTriggerTimeMs = 0L
+
     private var statusBadgeView: TextView? = null
     private var batteryTextView: TextView? = null
-    private var modeButtons = mutableListOf<Button>()
+    private var statusSubtitleView: TextView? = null
+    private var geminiBtnView: Button? = null
+    private val modeButtons = mutableListOf<Button>()
+
+    private data class QueuedVideoJob(
+        val rawFile: File,
+        val displayName: String,
+        val mode: OpenMetaRenderMode
+    )
+
+    private val renderChannel = Channel<QueuedVideoJob>(Channel.UNLIMITED)
+    private val pendingRenderCount = AtomicInteger(0)
+
+    var lastUserVisionQuery: String = "Коротко опиши, что перед пользователем на этом кадре."
 
     private val visionTriggers = listOf(
         "посмотри", "смотри", "глянь", "взгляни", "видишь",
-        "что это", "что тут", "что здесь", "что за", "что перед",
-        "прочитай", "переведи", "оцени", "сфоткай", "на фото", "покажи"
+        "что это", "сто это", "че это", "чё это", "что тут",
+        "что здесь", "что за", "что перед", "кто это",
+        "прочитай", "переведи", "оцени", "сфоткай", "сфотай", "на фото", "покажи"
     )
 
     var currentRenderMode: OpenMetaRenderMode
@@ -138,6 +173,16 @@ class OpenMetaManager(
         get() = prefs.getString("gemini_api_key", "") ?: ""
         set(value) {
             prefs.edit().putString("gemini_api_key", value.trim()).apply()
+            updateGeminiButtonText()
+        }
+
+    var geminiBaseUrl: String
+        get() = prefs.getString("gemini_base_url", "https://generativelanguage.googleapis.com")
+            ?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }
+            ?: "https://generativelanguage.googleapis.com"
+        set(value) {
+            val clean = value.trim().trimEnd('/').ifEmpty { "https://generativelanguage.googleapis.com" }
+            prefs.edit().putString("gemini_base_url", clean).apply()
         }
 
     init {
@@ -147,9 +192,53 @@ class OpenMetaManager(
                 tts?.setSpeechRate(1.06f)
             }
         }
+        setupMediaSessionInterceptor()
+        startBackgroundRenderWorker()
     }
 
-    // Отрисовка русского интерфейса в стиле Meta View поверх стандартного экрана
+    private fun setupMediaSessionInterceptor() {
+        runCatching {
+            mediaSession = MediaSession(activity, "OpenMetaRuSession").apply {
+                setPlaybackState(
+                    PlaybackState.Builder()
+                        .setActions(
+                            PlaybackState.ACTION_PLAY or
+                                PlaybackState.ACTION_PAUSE or
+                                PlaybackState.ACTION_PLAY_PAUSE
+                        )
+                        .setState(PlaybackState.STATE_PAUSED, 0L, 1f)
+                        .build()
+                )
+                setCallback(object : MediaSession.Callback() {
+                    override fun onMediaButtonEvent(mediaButtonIntent: Intent): Boolean {
+                        val event = mediaButtonIntent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
+                        if (event != null && event.action == KeyEvent.ACTION_DOWN) {
+                            when (event.keyCode) {
+                                KeyEvent.KEYCODE_VOICE_ASSIST,
+                                KeyEvent.KEYCODE_ASSIST,
+                                KeyEvent.KEYCODE_HEADSETHOOK,
+                                KeyEvent.KEYCODE_CALL -> {
+                                    onTouchpadLongHold()
+                                    return true
+                                }
+                            }
+                        }
+                        return super.onMediaButtonEvent(mediaButtonIntent)
+                    }
+                })
+                isActive = true
+            }
+        }
+    }
+
+    private fun releaseStuckCommandSlotIfIdle() {
+        if (GlassesSessionCoordinator.currentSession() == null) {
+            GlassesSessionCoordinator.clearForDisconnectedDevice()
+        }
+    }
+
+    // ================= РУССКИЙ ИНТЕРФЕЙС В СТИЛЕ META VIEW =================
+
     fun attachRussianMetaUi() {
         val rootContainer = FrameLayout(activity).apply {
             layoutParams = FrameLayout.LayoutParams(
@@ -172,7 +261,7 @@ class OpenMetaManager(
             setPadding(dp(20), dp(42), dp(20), dp(28))
         }
 
-        // 1. Шапка: Название + Статус подключения
+        // 1. Шапка: Ray-Ban | AI + Индикатор подключения
         val headerRow = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -187,11 +276,15 @@ class OpenMetaManager(
         }
 
         statusBadgeView = TextView(activity).apply {
-            text = "● Готов к работе"
-            setTextColor(Color.parseColor("#4ADE80"))
+            text = "○ Подключить"
+            setTextColor(Color.parseColor("#F87171"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             setPadding(dp(14), dp(6), dp(14), dp(6))
             background = roundedBg("#1C1E24", 20f)
+            setOnClickListener {
+                releaseStuckCommandSlotIfIdle()
+                onScanClick()
+            }
         }
 
         headerRow.addView(titleText)
@@ -210,24 +303,24 @@ class OpenMetaManager(
         }
 
         batteryTextView = TextView(activity).apply {
-            text = "Очки подключены • Исходник: 1600×1200 (4:3)"
+            text = "Заряд очков: --% • Кадр: 1600×1200 (4:3)"
             setTextColor(Color.parseColor("#F1F5F9"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             setTypeface(typeface, Typeface.BOLD)
         }
 
-        val hintText = TextView(activity).apply {
-            text = "Кнопка: Фото / Видео • Удержание дужки: Русский ИИ («Посмотри...»)"
+        statusSubtitleView = TextView(activity).apply {
+            text = "Удержание дужки: ИИ (скажи «Посмотри» или «Что это» для фото)"
             setTextColor(Color.parseColor("#94A3B8"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             setPadding(0, dp(6), 0, 0)
         }
 
         statusCard.addView(batteryTextView)
-        statusCard.addView(hintText)
+        statusCard.addView(statusSubtitleView)
         content.addView(statusCard)
 
-        // 3. Главная синяя кнопка: Импорт и обработка медиа
+        // 3. Главная синяя кнопка выгрузки медиа
         val btnSync = Button(activity).apply {
             text = "Скинуть и обработать медиа с очков"
             setTextColor(Color.WHITE)
@@ -236,12 +329,13 @@ class OpenMetaManager(
             background = roundedBg("#0064E0", 14f)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(58)
-            ).apply { topMargin = dp(18) }
+                dp(56)
+            ).apply { topMargin = dp(16) }
             setOnClickListener {
+                releaseStuckCommandSlotIfIdle()
                 Toast.makeText(
                     activity,
-                    "Запуск выгрузки (${currentRenderMode.title})...",
+                    "Выгрузка с очков (${currentRenderMode.title})...",
                     Toast.LENGTH_SHORT
                 ).show()
                 onSyncClick()
@@ -249,13 +343,28 @@ class OpenMetaManager(
         }
         content.addView(btnSync)
 
-        // 4. Заголовок выбора режима обработки и стабилизации
+        // 4. Кнопка «Открыть медиа (Скинутые файлы)»
+        val btnMediaGallery = Button(activity).apply {
+            text = "📂 Открыть медиа (Скинутые файлы)"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            isAllCaps = false
+            background = roundedBg("#1E293B", 14f, strokeColor = "#334155")
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(50)
+            ).apply { topMargin = dp(10) }
+            setOnClickListener { showBuiltInGalleryDialog() }
+        }
+        content.addView(btnMediaGallery)
+
+        // 5. Переключатель режимов качества и стабилизации
         val modeHeader = TextView(activity).apply {
             text = "РЕЖИМ КАЧЕСТВА И СТАБИЛИЗАЦИИ:"
             setTextColor(Color.parseColor("#94A3B8"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setTypeface(typeface, Typeface.BOLD)
-            setPadding(dp(4), dp(22), 0, dp(8))
+            setPadding(dp(4), dp(20), 0, dp(8))
         }
         content.addView(modeHeader)
 
@@ -274,7 +383,7 @@ class OpenMetaManager(
                 ).apply { bottomMargin = dp(8) }
                 setOnClickListener {
                     currentRenderMode = mode
-                    Toast.makeText(activity, "Выбран: ${mode.title}", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(activity, "Режим: ${mode.title}", Toast.LENGTH_SHORT).show()
                 }
             }
             modeButtons.add(btn)
@@ -282,7 +391,7 @@ class OpenMetaManager(
         }
         updateModeButtonsUi()
 
-        // 5. Быстрые кнопки управления (ИИ, Фото, Видео)
+        // 6. Быстрые команды: Фото, Видео, Настройка Gemini
         val actionsHeader = TextView(activity).apply {
             text = "БЫСТРЫЕ КОМАНДЫ:"
             setTextColor(Color.parseColor("#94A3B8"))
@@ -291,20 +400,6 @@ class OpenMetaManager(
             setPadding(dp(4), dp(14), 0, dp(8))
         }
         content.addView(actionsHeader)
-
-        val btnAskAi = Button(activity).apply {
-            text = "🎙️ Спросить русский ИИ (или скажи «Посмотри»)"
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-            isAllCaps = false
-            background = roundedBg("#1E293B", 12f)
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(52)
-            ).apply { bottomMargin = dp(8) }
-            setOnClickListener { onTouchpadLongHold() }
-        }
-        content.addView(btnAskAi)
 
         val mediaRow = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -317,59 +412,47 @@ class OpenMetaManager(
         val btnPhoto = Button(activity).apply {
             text = "📷 Фото"
             setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             isAllCaps = false
             background = roundedBg("#1C1E24", 12f)
-            layoutParams = LinearLayout.LayoutParams(0, dp(48), 1f).apply { rightMargin = dp(6) }
-            setOnClickListener { onPhotoClick() }
+            layoutParams = LinearLayout.LayoutParams(0, dp(50), 1f).apply { rightMargin = dp(6) }
+            setOnClickListener {
+                releaseStuckCommandSlotIfIdle()
+                onPhotoClick()
+            }
         }
 
         val btnVideo = Button(activity).apply {
             text = "🎥 Видео старт/стоп"
             setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             isAllCaps = false
             background = roundedBg("#1C1E24", 12f)
-            layoutParams = LinearLayout.LayoutParams(0, dp(48), 1f).apply { leftMargin = dp(6) }
-            setOnClickListener { onVideoClick() }
+            layoutParams = LinearLayout.LayoutParams(0, dp(50), 1f).apply { leftMargin = dp(6) }
+            setOnClickListener {
+                releaseStuckCommandSlotIfIdle()
+                onVideoClick()
+            }
         }
 
         mediaRow.addView(btnPhoto)
         mediaRow.addView(btnVideo)
         content.addView(mediaRow)
 
-        // 6. Нижние сервисные кнопки: Поиск очков, Ключ Gemini и Инженерное меню
-        val serviceRow = LinearLayout(activity).apply {
-            orientation = LinearLayout.HORIZONTAL
+        geminiBtnView = Button(activity).apply {
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            isAllCaps = false
+            background = roundedBg("#181A20", 12f, strokeColor = "#262932")
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(10) }
+                dp(50)
+            )
+            setOnClickListener { showGeminiSettingsDialog() }
         }
+        updateGeminiButtonText()
+        content.addView(geminiBtnView)
 
-        val btnBind = Button(activity).apply {
-            text = "🔍 Привязать очки"
-            setTextColor(Color.parseColor("#E2E8F0"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            isAllCaps = false
-            background = roundedBg("#181A20", 10f)
-            layoutParams = LinearLayout.LayoutParams(0, dp(44), 1f).apply { rightMargin = dp(6) }
-            setOnClickListener { onScanClick() }
-        }
-
-        val btnApiKey = Button(activity).apply {
-            text = "🔑 Ключ Gemini ИИ"
-            setTextColor(Color.parseColor("#E2E8F0"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            isAllCaps = false
-            background = roundedBg("#181A20", 10f)
-            layoutParams = LinearLayout.LayoutParams(0, dp(44), 1f).apply { leftMargin = dp(6) }
-            setOnClickListener { showApiKeyDialog() }
-        }
-
-        serviceRow.addView(btnBind)
-        serviceRow.addView(btnApiKey)
-        content.addView(serviceRow)
-
-        // Плавающая кнопка возврата в русский интерфейс, если открыто инженерное меню
         val floatingBackBtn = Button(activity).apply {
             text = "🕶️ Экран Meta RU"
             setTextColor(Color.WHITE)
@@ -388,22 +471,43 @@ class OpenMetaManager(
             }
         }
 
-        val btnToggleRawUi = Button(activity).apply {
-            text = "⚙️ Открыть инженерное меню CyanBridge"
+        val bottomServiceRow = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(14) }
+        }
+
+        val btnBind = Button(activity).apply {
+            text = "🔍 Привязать очки"
             setTextColor(Color.parseColor("#64748B"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             isAllCaps = false
             setBackgroundColor(Color.TRANSPARENT)
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(44)
-            ).apply { topMargin = dp(12) }
+            layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f)
+            setOnClickListener {
+                releaseStuckCommandSlotIfIdle()
+                onScanClick()
+            }
+        }
+
+        val btnToggleRawUi = Button(activity).apply {
+            text = "⚙️ Стоковое меню"
+            setTextColor(Color.parseColor("#64748B"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            isAllCaps = false
+            setBackgroundColor(Color.TRANSPARENT)
+            layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f)
             setOnClickListener {
                 dashboardScroll.visibility = View.GONE
                 floatingBackBtn.visibility = View.VISIBLE
             }
         }
-        content.addView(btnToggleRawUi)
+
+        bottomServiceRow.addView(btnBind)
+        bottomServiceRow.addView(btnToggleRawUi)
+        content.addView(bottomServiceRow)
 
         floatingBackBtn.setOnClickListener {
             dashboardScroll.visibility = View.VISIBLE
@@ -423,11 +527,22 @@ class OpenMetaManager(
         )
     }
 
+    private fun updateGeminiButtonText() {
+        val hasKey = geminiApiKey.isNotBlank()
+        geminiBtnView?.text = if (hasKey) {
+            "🔑 Настройка Gemini ИИ (Ключ активен ✓)"
+        } else {
+            "🔑 Настройка Gemini ИИ (Ввести ключ)"
+        }
+    }
+
     fun updateStatusUi(connected: Boolean, battery: Int?) {
         mainHandler.post {
-            statusBadgeView?.text = if (connected) "● Подключено" else "○ Отключено"
+            val tuneBudsConnected = runCatching { TuneBudsManager.getInstance(activity).isConnected() }.getOrDefault(false)
+            val isOnline = connected || tuneBudsConnected || (battery != null && battery > 0)
+            statusBadgeView?.text = if (isOnline) "● Подключено" else "○ Подключить"
             statusBadgeView?.setTextColor(
-                if (connected) Color.parseColor("#4ADE80") else Color.parseColor("#F87171")
+                if (isOnline) Color.parseColor("#4ADE80") else Color.parseColor("#F87171")
             )
             val batStr = battery?.let { "$it%" } ?: "--%"
             batteryTextView?.text = "Заряд очков: $batStr • Кадр: 1600×1200 (4:3)"
@@ -446,35 +561,223 @@ class OpenMetaManager(
         }
     }
 
-    private fun showApiKeyDialog() {
-        val input = EditText(activity).apply {
-            hint = "Вставь API-ключ Gemini (AIzaSy...)"
+    // ================= ВСТРОЕННАЯ ГАЛЕРЕЯ СКИНУТЫХ ФАЙЛОВ =================
+
+    private data class GalleryItem(
+        val id: Long,
+        val name: String,
+        val uri: Uri,
+        val mimeType: String,
+        val dateTaken: Long,
+        val sizeBytes: Long
+    )
+
+    private fun showBuiltInGalleryDialog() {
+        val items = querySyncedMediaFiles()
+        val pending = pendingRenderCount.get()
+        val pendingNote = if (pending > 0) "\n\n⚡ В фоне обрабатывается в 2K: $pending видео..." else ""
+
+        if (items.isEmpty()) {
+            AlertDialog.Builder(activity)
+                .setTitle("📂 Скинутые медиафайлы")
+                .setMessage("В папке DCIM/CyanBridge пока нет скачанных фото или видео.$pendingNote")
+                .setPositiveButton("Аудиозаписи") { _, _ ->
+                    activity.startActivity(Intent(activity, RecordingsListActivity::class.java))
+                }
+                .setNegativeButton("Закрыть", null)
+                .show()
+            return
+        }
+
+        val sdf = SimpleDateFormat("dd.MM HH:mm", Locale.getDefault())
+        val labels = items.map { item ->
+            val is2K = item.name.startsWith("Meta2K_", ignoreCase = true)
+            val icon = when {
+                item.mimeType.startsWith("video") && is2K -> "🎬 [2K Стаб]"
+                item.mimeType.startsWith("video") -> "🎬 [Исходник]"
+                else -> "🖼️ Фото"
+            }
+            val sizeMb = String.format(Locale.US, "%.1f МБ", item.sizeBytes / (1024f * 1024f))
+            val dateStr = sdf.format(Date(item.dateTaken))
+            "$icon ${item.name}\n$dateStr • $sizeMb"
+        }.toTypedArray()
+
+        val title = if (pending > 0) {
+            "📂 Медиа (${items.size}) • ⚡ 2K-рендер: $pending"
+        } else {
+            "📂 Скинутые файлы (${items.size})"
+        }
+
+        AlertDialog.Builder(activity)
+            .setTitle(title)
+            .setItems(labels) { _, which ->
+                val chosen = items[which]
+                try {
+                    val viewIntent = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(chosen.uri, chosen.mimeType)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    activity.startActivity(viewIntent)
+                } catch (e: Exception) {
+                    Toast.makeText(activity, "Не найдено приложение для открытия файла", Toast.LENGTH_SHORT).show()
+                }
+            }
+            .setNeutralButton("Аудиозаписи") { _, _ ->
+                activity.startActivity(Intent(activity, RecordingsListActivity::class.java))
+            }
+            .setNegativeButton("Закрыть", null)
+            .show()
+    }
+
+    private fun querySyncedMediaFiles(): List<GalleryItem> {
+        val result = mutableListOf<GalleryItem>()
+        val resolver = activity.contentResolver
+
+        fun queryUri(contentUri: Uri, defaultMime: String) {
+            val projection = arrayOf(
+                MediaStore.MediaColumns._ID,
+                MediaStore.MediaColumns.DISPLAY_NAME,
+                MediaStore.MediaColumns.MIME_TYPE,
+                MediaStore.MediaColumns.DATE_MODIFIED,
+                MediaStore.MediaColumns.SIZE,
+                MediaStore.MediaColumns.RELATIVE_PATH
+            )
+            runCatching {
+                resolver.query(
+                    contentUri,
+                    projection,
+                    null,
+                    null,
+                    "${MediaStore.MediaColumns.DATE_MODIFIED} DESC"
+                )?.use { cursor ->
+                    val idCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+                    val nameCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+                    val mimeCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.MIME_TYPE)
+                    val dateCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_MODIFIED)
+                    val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.SIZE)
+                    val pathCol = cursor.getColumnIndex(MediaStore.MediaColumns.RELATIVE_PATH)
+
+                    while (cursor.moveToNext() && result.size < 45) {
+                        val relPath = if (pathCol >= 0) cursor.getString(pathCol).orEmpty() else ""
+                        val name = cursor.getString(nameCol).orEmpty()
+                        if (relPath.contains("CyanBridge", ignoreCase = true) ||
+                            name.startsWith("Meta2K_", ignoreCase = true) ||
+                            name.startsWith("Glasses_", ignoreCase = true)
+                        ) {
+                            val id = cursor.getLong(idCol)
+                            val mime = cursor.getString(mimeCol) ?: defaultMime
+                            val dateSec = cursor.getLong(dateCol)
+                            val size = cursor.getLong(sizeCol)
+                            result.add(
+                                GalleryItem(
+                                    id = id,
+                                    name = name,
+                                    uri = ContentUris.withAppendedId(contentUri, id),
+                                    mimeType = mime,
+                                    dateTaken = dateSec * 1000L,
+                                    sizeBytes = size
+                                )
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        queryUri(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, "video/mp4")
+        queryUri(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, "image/jpeg")
+        return result.sortedByDescending { it.dateTaken }
+    }
+
+    // ================= НАСТРОЙКА GEMINI И HANDS-FREE АССИСТЕНТ С ДУЖКИ =================
+
+    private fun showGeminiSettingsDialog() {
+        val container = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(12), dp(20), dp(4))
+        }
+
+        val keyLabel = TextView(activity).apply {
+            text = "API-ключ Google Gemini:"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+        }
+        val keyInput = EditText(activity).apply {
+            hint = "AIzaSy..."
             setText(geminiApiKey)
             inputType = InputType.TYPE_CLASS_TEXT
-            setPadding(dp(16), dp(12), dp(16), dp(12))
         }
+
+        val proxyLabel = TextView(activity).apply {
+            text = "Сервер API (оставь стандартный или укажи прокси для работы без VPN):"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setPadding(0, dp(10), 0, 0)
+        }
+        val proxyInput = EditText(activity).apply {
+            hint = "https://generativelanguage.googleapis.com"
+            setText(geminiBaseUrl)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+        }
+
+        container.addView(keyLabel)
+        container.addView(keyInput)
+        container.addView(proxyLabel)
+        container.addView(proxyInput)
+
         AlertDialog.Builder(activity)
-            .setTitle("Ключ нейросети Gemini")
-            .setMessage("Ключ сохраняется локально на телефоне для голосового ассистента и функции «Посмотри».")
-            .setView(input)
+            .setTitle("Настройка Gemini ИИ")
+            .setMessage("Зажми дужку на очках → после звукового сигнала произнеси вопрос. Если в вопросе есть «Посмотри» или «Что это», очки сами сделают фото и озвучат ответ.")
+            .setView(container)
             .setPositiveButton("Сохранить") { _, _ ->
-                geminiApiKey = input.text.toString()
+                geminiApiKey = keyInput.text.toString()
+                geminiBaseUrl = proxyInput.text.toString()
                 Toast.makeText(activity, "Ключ сохранен!", Toast.LENGTH_SHORT).show()
+            }
+            .setNeutralButton("Проверить голос") { _, _ ->
+                geminiApiKey = keyInput.text.toString()
+                geminiBaseUrl = proxyInput.text.toString()
+                onTouchpadLongHold()
             }
             .setNegativeButton("Отмена", null)
             .show()
     }
 
-    // ================= ГОЛОСОВОЙ АССИСТЕНТ И «ПОСМОТРИ» =================
-
+    // Вызывается при удержании сенсорной дужки очков (без лишних окон на экране)
     fun onTouchpadLongHold() {
+        val now = System.currentTimeMillis()
+        if (now - lastTriggerTimeMs < 1200L) return
+        lastTriggerTimeMs = now
+
         mainHandler.post {
-            speakRussian("Слушаю")
-            mainHandler.postDelayed({ startRussianListening() }, 450)
+            releaseStuckCommandSlotIfIdle()
+            if (activity.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) !=
+                PackageManager.PERMISSION_GRANTED
+            ) {
+                activity.requestPermissions(arrayOf(android.Manifest.permission.RECORD_AUDIO), 701)
+                speakRussian("Разреши доступ к микрофону на телефоне")
+                return@post
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                activity.setShowWhenLocked(true)
+                activity.setTurnScreenOn(true)
+            }
+            activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+            tts?.stop()
+            runCatching {
+                val tone = ToneGenerator(AudioManager.STREAM_MUSIC, 95)
+                tone.startTone(ToneGenerator.TONE_PROP_BEEP, 150)
+                mainHandler.postDelayed({ tone.release() }, 190)
+            }
+
+            statusSubtitleView?.text = "🎙️ Слушаю... Скажи вопрос или «Посмотри, что это»"
+            statusSubtitleView?.setTextColor(Color.parseColor("#4ADE80"))
+
+            mainHandler.postDelayed({ startHandsFreeListening() }, 220)
         }
     }
 
-    private fun startRussianListening() {
+    private fun startHandsFreeListening() {
         try {
             speechRecognizer?.destroy()
             speechRecognizer = SpeechRecognizer.createSpeechRecognizer(activity).apply {
@@ -483,6 +786,7 @@ class OpenMetaManager(
                         val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                         val query = matches?.firstOrNull()?.trim().orEmpty()
                         if (query.isNotEmpty()) {
+                            statusSubtitleView?.text = "🗣️ «$query»"
                             handleRussianVoiceCommand(query)
                         } else {
                             speakRussian("Не расслышал, повтори")
@@ -490,7 +794,12 @@ class OpenMetaManager(
                     }
 
                     override fun onError(error: Int) {
-                        Log.w("OpenMetaAI", "Speech error=$error")
+                        Log.w("OpenMetaAI", "SpeechRecognizer error=$error")
+                        statusSubtitleView?.text = "Удержание дужки: ИИ («Посмотри» / «Что это»)"
+                        statusSubtitleView?.setTextColor(Color.parseColor("#94A3B8"))
+                        if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+                            speakRussian("Не расслышал")
+                        }
                     }
 
                     override fun onReadyForSpeech(params: Bundle?) {}
@@ -506,86 +815,139 @@ class OpenMetaManager(
             val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, "ru-RU")
                 putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1700)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1700)
             }
             speechRecognizer?.startListening(intent)
         } catch (e: Exception) {
-            Log.e("OpenMetaAI", "Failed to start Russian recognition", e)
+            Log.e("OpenMetaAI", "SpeechRecognizer failed", e)
+            speakRussian("Не удалось включить распознавание речи")
         }
     }
 
-    private fun handleRussianVoiceCommand(query: String) {
+    fun handleRussianVoiceCommand(query: String) {
         val lower = query.lowercase(Locale("ru", "RU"))
         val needsCamera = visionTriggers.any { lower.contains(it) }
 
-        if (needsCamera) {
-            speakRussian("Секунду, смотрю")
-            // Если пользователь сказал «посмотри», запускаем штатный захват кадра с очков в ИИ
-            onVisionPhotoRequest()
-            return
-        }
-
         if (geminiApiKey.isBlank()) {
-            speakRussian("Введи ключ нейросети в настройках на главном экране")
+            speakRussian("Сначала сохрани ключ нейросети в настройках на главном экране")
             return
         }
 
+        if (needsCamera) {
+            lastUserVisionQuery = query
+            speakRussian("Секунду, смотрю")
+            statusSubtitleView?.text = "📸 Снимаю кадр с очков: «$query»..."
+            statusSubtitleView?.setTextColor(Color.parseColor("#60A5FA"))
+
+            scope.launch(Dispatchers.IO) {
+                val tuneBuds = TuneBudsManager.getInstance(activity)
+                if (tuneBuds.isConnected()) {
+                    val photoBytes = runCatching { tuneBuds.capturePhotoForAi() }.getOrNull()
+                    if (photoBytes != null && photoBytes.isNotEmpty()) {
+                        val answer = askGeminiDirect(query, photoBytes)
+                        withContext(Dispatchers.Main) {
+                            statusSubtitleView?.text = "🤖 $answer"
+                            statusSubtitleView?.setTextColor(Color.parseColor("#4ADE80"))
+                            speakRussian(answer)
+                        }
+                    } else {
+                        withContext(Dispatchers.Main) {
+                            speakRussian("Не удалось получить кадр с очков, попробуй еще раз")
+                        }
+                    }
+                } else {
+                    withContext(Dispatchers.Main) {
+                        releaseStuckCommandSlotIfIdle()
+                        onVisionPhotoRequest()
+                    }
+                }
+            }
+            return
+        }
+
+        statusSubtitleView?.text = "🧠 Думаю: «$query»..."
         scope.launch(Dispatchers.IO) {
             val reply = askGeminiDirect(query, null)
             withContext(Dispatchers.Main) {
+                statusSubtitleView?.text = "🤖 $reply"
+                statusSubtitleView?.setTextColor(Color.parseColor("#4ADE80"))
                 speakRussian(reply)
             }
         }
     }
 
-    private fun askGeminiDirect(prompt: String, imageBytes: ByteArray?): String {
-        return try {
-            val sysPrompt = "Ты голосовой ассистент в умных очках пользователя. " +
-                "Отвечай на русском языке, кратко и по делу (максимум 2-3 предложения), " +
-                "без списков и символов разметки, чтобы текст легко читался вслух."
+    fun askGeminiDirect(prompt: String, imageBytes: ByteArray?): String {
+        val models = listOf("gemini-2.5-flash", "gemini-2.0-flash")
+        var lastError = "ошибка сети"
 
-            val parts = JSONArray().apply {
-                put(JSONObject().put("text", "$sysPrompt\n\nВопрос: $prompt"))
-                if (imageBytes != null) {
-                    val b64 = Base64.encodeToString(imageBytes, Base64.NO_WRAP)
-                    val inlineData = JSONObject()
-                        .put("mime_type", "image/jpeg")
-                        .put("data", b64)
-                    put(JSONObject().put("inline_data", inlineData))
+        for (modelName in models) {
+            try {
+                val sysPrompt = "Ты голосовой ассистент, встроенный в умные очки пользователя. " +
+                    "Отвечай на русском языке, коротко и по делу (1-3 предложения), " +
+                    "без списков и звездочек, так как твой ответ сразу читается вслух в наушники очков."
+
+                val parts = JSONArray().apply {
+                    put(JSONObject().put("text", "$sysPrompt\n\nВопрос: $prompt"))
+                    if (imageBytes != null) {
+                        val b64 = Base64.encodeToString(imageBytes, Base64.NO_WRAP)
+                        val inlineData = JSONObject()
+                            .put("mime_type", "image/jpeg")
+                            .put("data", b64)
+                        put(JSONObject().put("inline_data", inlineData))
+                    }
                 }
+
+                val payload = JSONObject().put(
+                    "contents",
+                    JSONArray().put(JSONObject().put("parts", parts))
+                ).toString()
+
+                val endpoint = "$geminiBaseUrl/v1beta/models/$modelName:generateContent?key=$geminiApiKey"
+                val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    connectTimeout = 15000
+                    readTimeout = 20000
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                }
+
+                conn.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
+                val code = conn.responseCode
+                if (code == HttpURLConnection.HTTP_OK) {
+                    val responseText = conn.inputStream.bufferedReader().use { it.readText() }
+                    conn.disconnect()
+                    return JSONObject(responseText)
+                        .getJSONArray("candidates")
+                        .getJSONObject(0)
+                        .getJSONObject("content")
+                        .getJSONArray("parts")
+                        .getJSONObject(0)
+                        .getString("text")
+                        .replace("*", "")
+                        .trim()
+                } else {
+                    val errBody = conn.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+                    conn.disconnect()
+                    Log.e("OpenMetaAI", "Gemini ($modelName) HTTP $code: $errBody")
+                    if (errBody.contains("User location is not supported", ignoreCase = true) ||
+                        errBody.contains("FAILED_PRECONDITION", ignoreCase = true)
+                    ) {
+                        return "Гугл блокирует запрос с российского айпи без ВПН. Включи ВПН или укажи прокси в настройках."
+                    }
+                    if (code == 400 && errBody.contains("API_KEY_INVALID", ignoreCase = true)) {
+                        return "Указан неверный ключ нейросети Джемини."
+                    }
+                    lastError = "код $code"
+                }
+            } catch (e: Exception) {
+                Log.e("OpenMetaAI", "Gemini ($modelName) error", e)
+                lastError = "нет связи с сервером"
             }
-
-            val payload = JSONObject().put(
-                "contents",
-                JSONArray().put(JSONObject().put("parts", parts))
-            ).toString()
-
-            val url = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$geminiApiKey")
-            val conn = (url.openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                connectTimeout = 15000
-                readTimeout = 20000
-                doOutput = true
-                setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            }
-
-            conn.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
-            val responseText = conn.inputStream.bufferedReader().use { it.readText() }
-            conn.disconnect()
-
-            JSONObject(responseText)
-                .getJSONArray("candidates")
-                .getJSONObject(0)
-                .getJSONObject("content")
-                .getJSONArray("parts")
-                .getJSONObject(0)
-                .getString("text")
-                .replace("*", "")
-                .trim()
-        } catch (e: Exception) {
-            Log.e("OpenMetaAI", "Gemini request failed", e)
-            "Не удалось получить ответ от нейросети."
         }
+        return "Не удалось связаться с нейросетью, $lastError."
     }
 
     fun speakRussian(text: String) {
@@ -595,7 +957,7 @@ class OpenMetaManager(
         tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, "OPENMETA_RU_${System.currentTimeMillis()}")
     }
 
-    // ================= ПАЙПЛАЙН ФОТО И ВИДЕО (4:3 2K + СТАБА + ГОРИЗОНТ) =================
+    // ================= ПАЙПЛАЙН ФОТО И ФОНОВАЯ ОЧЕРЕДЬ ВИДЕО 2K + СТАБА =================
 
     fun processPhotoStream(rawInput: InputStream, fileName: String): File {
         val tempRaw = File(activity.cacheDir, "raw_$fileName")
@@ -637,16 +999,56 @@ class OpenMetaManager(
         }
     }
 
+    // Не задерживает Wi-Fi синхронизацию очков: мгновенно отдает сырой файл, а 2K-рендер ставит в фоновую очередь
     suspend fun processVideoFile(rawVideoFile: File): File {
         val mode = currentRenderMode
         if (mode == OpenMetaRenderMode.RAW_ORIGINAL) {
             return rawVideoFile
         }
 
+        val queuedCopy = File(activity.cacheDir, "queue_${System.currentTimeMillis()}_${rawVideoFile.name}")
+        rawVideoFile.copyTo(queuedCopy, overwrite = true)
+        val cleanName = rawVideoFile.name.substringAfterLast('_')
+        val count = pendingRenderCount.incrementAndGet()
+        updateRenderQueueUi(count, cleanName)
+        renderChannel.trySend(QueuedVideoJob(queuedCopy, cleanName, mode))
+
+        return rawVideoFile
+    }
+
+    private fun updateRenderQueueUi(remaining: Int, currentName: String?) {
+        mainHandler.post {
+            if (remaining > 0) {
+                statusSubtitleView?.text = "⚡ Фоновый 2K-рендер и стаба (осталось: $remaining) • ${currentName.orEmpty()}"
+                statusSubtitleView?.setTextColor(Color.parseColor("#60A5FA"))
+            } else {
+                statusSubtitleView?.text = "✅ 2K-рендер завершен! Ролики лежат в «Открыть медиа»"
+                statusSubtitleView?.setTextColor(Color.parseColor("#4ADE80"))
+            }
+        }
+    }
+
+    private fun startBackgroundRenderWorker() {
+        scope.launch(Dispatchers.IO) {
+            for (job in renderChannel) {
+                updateRenderQueueUi(pendingRenderCount.get(), job.displayName)
+                val renderedFile = renderVideoInternal(job.rawFile, job.mode)
+                if (renderedFile != job.rawFile && renderedFile.exists()) {
+                    saveRenderedVideoToMediaStore(renderedFile, "Meta2K_${job.displayName}")
+                    renderedFile.delete()
+                }
+                job.rawFile.delete()
+                val left = pendingRenderCount.decrementAndGet().coerceAtLeast(0)
+                updateRenderQueueUi(left, null)
+            }
+        }
+    }
+
+    private suspend fun renderVideoInternal(rawVideoFile: File, mode: OpenMetaRenderMode): File {
         val outFile = File(activity.cacheDir, "meta2k_${System.currentTimeMillis()}_${rawVideoFile.name}")
         return try {
             val lockHorizon = (mode == OpenMetaRenderMode.HORIZON_LOCK_2K)
-            val radius = if (lockHorizon) 12 else 8
+            val radius = if (lockHorizon) 5 else 3
             val trajectory = withContext(Dispatchers.Default) {
                 HorizonStabilizerEffect.analyzeWithHorizonLock(rawVideoFile, radius)
             }
@@ -656,6 +1058,7 @@ class OpenMetaManager(
                 val effects = listOf<Effect>(
                     HorizonStabilizerEffect(
                         trajectory = trajectory,
+                        stepUs = 120_000L,
                         baseZoom = 1.08f,
                         lockHorizon = lockHorizon
                     ),
@@ -684,7 +1087,6 @@ class OpenMetaManager(
                     .setEncoderFactory(encoderFactory)
                     .addListener(object : Transformer.Listener {
                         override fun onCompleted(composition: Composition, result: ExportResult) {
-                            rawVideoFile.delete()
                             deferred.complete(outFile)
                         }
 
@@ -693,7 +1095,7 @@ class OpenMetaManager(
                             result: ExportResult,
                             exception: ExportException
                         ) {
-                            Log.e("OpenMetaPipeline", "Media3 render error, falling back to raw", exception)
+                            Log.e("OpenMetaPipeline", "Media3 render error", exception)
                             outFile.delete()
                             deferred.complete(rawVideoFile)
                         }
@@ -706,6 +1108,35 @@ class OpenMetaManager(
         } catch (e: Exception) {
             Log.e("OpenMetaPipeline", "Video pipeline exception", e)
             rawVideoFile
+        }
+    }
+
+    private fun saveRenderedVideoToMediaStore(videoFile: File, displayName: String) {
+        try {
+            val nowMs = System.currentTimeMillis()
+            val resolver = activity.contentResolver
+            val values = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.DATE_TAKEN, nowMs)
+                put(MediaStore.Video.Media.DATE_ADDED, nowMs / 1000)
+                put(MediaStore.Video.Media.DATE_MODIFIED, nowMs / 1000)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(MediaStore.Video.Media.RELATIVE_PATH, SyncedMediaFolder.relativePath)
+                    put(MediaStore.Video.Media.IS_PENDING, 1)
+                }
+            }
+            val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: return
+            resolver.openOutputStream(uri, "w")?.use { out ->
+                videoFile.inputStream().use { it.copyTo(out) }
+                out.flush()
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val done = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
+                resolver.update(uri, done, null, null)
+            }
+        } catch (e: Exception) {
+            Log.e("OpenMetaPipeline", "Failed to save 2K video", e)
         }
     }
 
@@ -733,7 +1164,7 @@ class OpenMetaManager(
 @OptIn(UnstableApi::class)
 class HorizonStabilizerEffect(
     private val trajectory: List<FramePose>,
-    private val frameDurationUs: Long = 33_333L,
+    private val stepUs: Long = 120_000L,
     private val baseZoom: Float = 1.08f,
     private val lockHorizon: Boolean = true
 ) : MatrixTransformation {
@@ -747,10 +1178,10 @@ class HorizonStabilizerEffect(
             return matrix
         }
 
-        val exactIndex = presentationTimeUs.toFloat() / frameDurationUs.toFloat()
+        val exactIndex = presentationTimeUs.toFloat() / stepUs.toFloat()
         val i0 = exactIndex.toInt().coerceIn(0, trajectory.lastIndex)
         val i1 = (i0 + 1).coerceIn(0, trajectory.lastIndex)
-        val frac = exactIndex - i0
+        val frac = (exactIndex - i0).coerceIn(0f, 1f)
 
         val p0 = trajectory[i0]
         val p1 = trajectory[i1]
@@ -791,9 +1222,14 @@ class HorizonStabilizerEffect(
                 var cumY = 0f
                 var cumAngle = 0f
                 var timeMs = 0L
+                val stepMs = 120L
 
                 while (timeMs < durationMs) {
-                    val bmp = retriever.getFrameAtTime(timeMs * 1000L, MediaMetadataRetriever.OPTION_CLOSEST)
+                    val bmp = retriever.getFrameAtTime(
+                        timeMs * 1000L,
+                        MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+                    ) ?: retriever.getFrameAtTime(timeMs * 1000L, MediaMetadataRetriever.OPTION_CLOSEST)
+
                     if (bmp != null) {
                         val small = Bitmap.createScaledBitmap(bmp, 96, 72, true)
                         bmp.recycle()
@@ -807,12 +1243,12 @@ class HorizonStabilizerEffect(
                             cumY += (ly + ry) * 0.5f
                             val deltaY = (ry - ly) * 36f
                             val dAngle = Math.toDegrees(atan2(deltaY.toDouble(), 40.0)).toFloat()
-                            cumAngle = (cumAngle + dAngle) * 0.97f
+                            cumAngle = (cumAngle + dAngle) * 0.96f
                         }
                         prevLuma = currLuma
                     }
                     rawPoses.add(FramePose(cumX, cumY, cumAngle))
-                    timeMs += 33L
+                    timeMs += stepMs
                 }
             } catch (_: Exception) {
                 return emptyList()
@@ -886,6 +1322,7 @@ class MetaCinemaGlEffect : GlEffect {
     override fun toGlShaderProgram(context: Context, useHdr: Boolean): GlShaderProgram =
         MetaCinemaShaderProgram(useHdr)
 }
+
 @OptIn(UnstableApi::class)
 class MetaCinemaShaderProgram(useHdr: Boolean) : BaseGlShaderProgram(useHdr, 1) {
 
@@ -959,5 +1396,3 @@ class MetaCinemaShaderProgram(useHdr: Boolean) : BaseGlShaderProgram(useHdr, 1) 
         glProgram.delete()
     }
 }
-
-
