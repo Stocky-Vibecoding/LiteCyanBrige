@@ -5,6 +5,10 @@ on:
     branches: [ "*" ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+  packages: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -25,9 +29,13 @@ jobs:
 
       - name: Build Debug APK
         working-directory: android/CyanBridge
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPR_API_KEY: ${{ secrets.GITHUB_TOKEN }}
+          GPR_USER: ${{ github.actor }}
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace
+          ./gradlew assembleDebug -Pgpr.key=${{ secrets.GITHUB_TOKEN }} -Pgpr.user=${{ github.actor }} --no-daemon --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
