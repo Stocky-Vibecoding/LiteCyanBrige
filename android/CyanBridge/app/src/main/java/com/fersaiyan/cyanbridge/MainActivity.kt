@@ -814,6 +814,12 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
         BatteryOptimizationGuideActivity.launchIfNeeded(this)
         openMetaManager.attachRussianMetaUi()
+        if (intent?.action == Intent.ACTION_VOICE_COMMAND ||
+            intent?.action == Intent.ACTION_ASSIST ||
+            intent?.action == "android.speech.action.WEB_SEARCH"
+        ) {
+            openMetaManager.onTouchpadLongHold()
+        }
     }
 
     override fun onStart() {
@@ -1107,6 +1113,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        if (intent.action == Intent.ACTION_VOICE_COMMAND ||
+            intent.action == Intent.ACTION_ASSIST ||
+            intent.action == "android.speech.action.WEB_SEARCH"
+        ) {
+            openMetaManager.onTouchpadLongHold()
+            return
+        }
         if (handleMetaRegistrationIntent(intent)) {
             updateMetaRaybanUiState()
         }
