@@ -886,12 +886,20 @@ class MetaCinemaGlEffect : GlEffect {
     override fun toGlShaderProgram(context: Context, useHdr: Boolean): GlShaderProgram =
         MetaCinemaShaderProgram(useHdr)
 }
-
 @OptIn(UnstableApi::class)
 class MetaCinemaShaderProgram(useHdr: Boolean) : BaseGlShaderProgram(useHdr, 1) {
 
     private val glProgram: GlProgram = GlProgram(VERTEX_SHADER, FRAGMENT_SHADER).apply {
-        setBufferAttribute("aFramePosition", GlProgram.getNormalizedCoordinateBounds(), 4)
+        setBufferAttribute(
+            "aFramePosition",
+            floatArrayOf(
+                -1f, -1f, 0f, 1f,
+                 1f, -1f, 0f, 1f,
+                -1f,  1f, 0f, 1f,
+                 1f,  1f, 0f, 1f
+            ),
+            4
+        )
     }
 
     companion object {
@@ -930,4 +938,26 @@ class MetaCinemaShaderProgram(useHdr: Boolean) : BaseGlShaderProgram(useHdr, 1) 
 
                 float luma = dot(graded, vec3(0.299, 0.587, 0.114));
                 float sat = max(graded.r, max(graded.g, graded.b)) - min(graded.r, min(graded.g, graded.b));
-                graded = mix(vec3
+                graded = mix(vec3(luma), graded, 1.0 + (0.28 * (1.0 - sat)));
+
+                gl_FragColor = vec4(clamp(graded, 0.0, 1.0), 1.0);
+            }
+        """
+    }
+
+    override fun configure(inputWidth: Int, inputHeight: Int): Size = Size(inputWidth, inputHeight)
+
+    override fun drawFrame(inputTexId: Int, presentationTimeUs: Long) {
+        glProgram.use()
+        glProgram.setSamplerTexIdUniform("uTexSampler", inputTexId, 0)
+        glProgram.bindAttributesAndUniforms()
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+    }
+
+    override fun release() {
+        super.release()
+        glProgram.delete()
+    }
+}
+
+
