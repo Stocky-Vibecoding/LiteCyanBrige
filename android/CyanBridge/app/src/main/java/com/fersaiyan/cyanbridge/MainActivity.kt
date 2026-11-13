@@ -10203,68 +10203,20 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-    private fun saveJpegToGallery(
+  private fun saveJpegToGallery(
         input: InputStream,
         displayName: String,
         takenTimeMs: Long,
         contentLength: Long = -1L,
     ): GallerySaveResult {
-        return try {
-            val rawTemp = File(cacheDir, "dl_raw_${System.currentTimeMillis()}_$displayName")
-            var rawBytes = 0L
-            FileOutputStream(rawTemp).use { out ->
-                val buffer = ByteArray(8 * 1024)
-                while (true) {
-                    val read = input.read(buffer)
-                    if (read <= 0) break
-                    out.write(buffer, 0, read)
-                    rawBytes += read
-                }
-            }
-            if (rawBytes <= 0L || (contentLength >= 0L && rawBytes != contentLength)) {
-                rawTemp.delete()
-                return GallerySaveResult(false, null, rawBytes)
-            }
-
-            val processedFile = rawTemp.inputStream().use {
-                openMetaManager.processPhotoStream(it, displayName)
-            }
-            rawTemp.delete()
-
-            val resolver = contentResolver
-            val values = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, displayName)
-                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                put(MediaStore.Images.Media.DATE_TAKEN, takenTimeMs)
-                put(MediaStore.Images.Media.DATE_ADDED, takenTimeMs / 1000)
-                put(MediaStore.Images.Media.DATE_MODIFIED, takenTimeMs / 1000)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    put(MediaStore.Images.Media.RELATIVE_PATH, SyncedMediaFolder.relativePath)
-                    put(MediaStore.Images.Media.IS_PENDING, 1)
-                }
-            }
-
-            val uri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-                ?: return GallerySaveResult(false, null, 0).also { processedFile.delete() }
-
-            var writtenBytes = 0L
-            resolver.openOutputStream(uri, "w")?.use { out ->
-                processedFile.inputStream().use { procIn ->
-                    writtenBytes = procIn.copyTo(out)
-                }
-                out.flush()
-            }
-            processedFile.delete()
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val done = ContentValues().apply { put(MediaStore.Images.Media.IS_PENDING, 0) }
-                resolver.update(uri, done, null, null)
-            }
-            GallerySaveResult(true, uri.toString(), writtenBytes)
-        } catch (e: Exception) {
-            Log.e("DataDownload", "saveJpegToGallery failed for $displayName: ${e.message}", e)
-            GallerySaveResult(false, null, 0)
-        }
+        val saved = openMetaManager.saveIncomingFileFromGlasses(
+            input = input,
+            displayName = displayName,
+            takenTimeMs = takenTimeMs,
+            contentLength = contentLength,
+            onBytesCopied = null
+        ) ?: return GallerySaveResult(false, null, 0L)
+        return GallerySaveResult(true, Uri.fromFile(saved).toString(), saved.length())
     }
 
     private fun saveMp4ToGallery(
@@ -10274,23 +10226,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         contentLength: Long,
         onBytesCopied: ((Long, Long) -> Unit)? = null,
     ): GallerySaveResult {
-        return try {
-            val rawTemp = File(cacheDir, "dl_raw_${System.currentTimeMillis()}_$displayName")
-            var rawBytes = 0L
-            FileOutputStream(rawTemp).use { out ->
-                val buffer = ByteArray(128 * 1024)
-                while (true) {
-                    val read = input.read(buffer)
-                    if (read <= 0) break
-                    out.write(buffer, 0, read)
-                    rawBytes += read
-                    onBytesCopied?.invoke(rawBytes, contentLength)
-                }
-            }
-            if (rawBytes <= 0L || (contentLength >= 0L && rawBytes != contentLength)) {
-                rawTemp.delete()
-                return GallerySaveResult(false, null, rawBytes)
-            }
+        val saved = openMetaManager.saveIncomingFileFromGlasses(
+            input = input,
+            displayName = displayName,
+            takenTimeMs = takenTimeMs,
+            contentLength = contentLength,
+            onBytesCopied = onBytesCopied
+        ) ?: return GallerySaveResult(false, null, 0L)
+        return GallerySaveResult(true, Uri.fromFile(saved).toString(), saved.length())
+    }
 
             // Прогоняем скачанный MP4 через выбранный режим (Исходник / Meta 2K / Горизонт Lock 2K)
             val finalVideoFile = kotlinx.coroutines.runBlocking {
