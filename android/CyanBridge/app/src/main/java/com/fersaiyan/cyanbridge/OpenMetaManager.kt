@@ -2420,4 +2420,316 @@ class VectorIconView(context: Context, private val type: Int, private var color:
     }
 }
 
-class WayfarerGlassesView(
+class WayfarerGlassesView(context: Context, private val isDark: Boolean) : View(context) {
+    private val framePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor(if (isDark) "#2A2E39" else "#1D1F23")
+        style = Paint.Style.FILL
+    }
+    private val frameOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor(if (isDark) "#4B5563" else "#111315")
+        style = Paint.Style.STROKE
+        strokeWidth = 3.5f
+    }
+    private val lensPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val cameraRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#9CA3AF")
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+    }
+    private val cameraCorePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#090A0C")
+        style = Paint.Style.FILL
+    }
+    private val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.argb(if (isDark) 60 else 28, 0, 0, 0)
+        style = Paint.Style.FILL
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val cx = w * 0.5f
+        val cy = h * 0.48f
+        val scale = min(w / 340f, h / 120f)
+
+        canvas.drawOval(
+            RectF(cx - 115f * scale, cy + 44f * scale, cx + 115f * scale, cy + 54f * scale),
+            shadowPaint
+        )
+
+        lensPaint.shader = LinearGradient(
+            cx, cy - 35f * scale, cx, cy + 35f * scale,
+            Color.parseColor("#2B3330"),
+            Color.parseColor("#141817"),
+            Shader.TileMode.CLAMP
+        )
+
+        val framePath = Path().apply {
+            moveTo(cx - 135f * scale, cy - 26f * scale)
+            quadTo(cx - 72f * scale, cy - 34f * scale, cx - 16f * scale, cy - 22f * scale)
+            quadTo(cx, cy - 25f * scale, cx + 16f * scale, cy - 22f * scale)
+            quadTo(cx + 72f * scale, cy - 34f * scale, cx + 135f * scale, cy - 26f * scale)
+            lineTo(cx + 130f * scale, cy - 8f * scale)
+            quadTo(cx + 122f * scale, cy + 36f * scale, cx + 72f * scale, cy + 38f * scale)
+            quadTo(cx + 26f * scale, cy + 36f * scale, cx + 15f * scale, cy - 6f * scale)
+            quadTo(cx, cy - 12f * scale, cx - 15f * scale, cy - 6f * scale)
+            quadTo(cx - 26f * scale, cy + 36f * scale, cx - 72f * scale, cy + 38f * scale)
+            quadTo(cx - 122f * scale, cy + 36f * scale, cx - 130f * scale, cy - 8f * scale)
+            close()
+        }
+        canvas.drawPath(framePath, framePaint)
+        canvas.drawPath(framePath, frameOutlinePaint)
+
+        val leftLens = RectF(cx - 114f * scale, cy - 21f * scale, cx - 24f * scale, cy + 29f * scale)
+        val rightLens = RectF(cx + 24f * scale, cy - 21f * scale, cx + 114f * scale, cy + 29f * scale)
+        canvas.drawRoundRect(leftLens, 18f * scale, 22f * scale, lensPaint)
+        canvas.drawRoundRect(rightLens, 18f * scale, 22f * scale, lensPaint)
+
+        val camY = cy - 16f * scale
+        val leftCamX = cx - 122f * scale
+        val rightCamX = cx + 122f * scale
+        canvas.drawCircle(leftCamX, camY, 5.2f * scale, cameraCorePaint)
+        canvas.drawCircle(leftCamX, camY, 5.2f * scale, cameraRingPaint)
+        canvas.drawCircle(rightCamX, camY, 5.2f * scale, cameraCorePaint)
+        canvas.drawCircle(rightCamX, camY, 5.2f * scale, cameraRingPaint)
+    }
+}
+
+@OptIn(UnstableApi::class)
+class HorizonStabilizerEffect(
+    private val trajectory: List<FramePose>,
+    private val stepUs: Long = 120_000L,
+    private val baseZoom: Float = 1.08f,
+    private val lockHorizon: Boolean = true
+) : MatrixTransformation {
+
+    data class FramePose(val dx: Float, val dy: Float, val rollDeg: Float)
+
+    override fun getMatrix(presentationTimeUs: Long): Matrix {
+        val matrix = Matrix()
+        if (trajectory.isEmpty()) {
+            matrix.postScale(baseZoom, baseZoom)
+            return matrix
+        }
+
+        val exactIndex = presentationTimeUs.toFloat() / stepUs.toFloat()
+        val i0 = exactIndex.toInt().coerceIn(0, trajectory.lastIndex)
+        val i1 = (i0 + 1).coerceIn(0, trajectory.lastIndex)
+        val frac = (exactIndex - i0).coerceIn(0f, 1f)
+
+        val p0 = trajectory[i0]
+        val p1 = trajectory[i1]
+
+        val shiftX = p0.dx + (p1.dx - p0.dx) * frac
+        val shiftY = p0.dy + (p1.dy - p0.dy) * frac
+        val angleDeg = if (lockHorizon) {
+            (p0.rollDeg + (p1.rollDeg - p0.rollDeg) * frac).coerceIn(-14f, 14f)
+        } else 0f
+
+        val rad = Math.toRadians(abs(angleDeg).toDouble())
+        val rotZoom = (cos(rad) + (4.0 / 3.0) * sin(rad)).toFloat()
+        val totalZoom = max(baseZoom, rotZoom * 1.04f)
+
+        val maxShift = baseZoom - 1.0f
+        val clampedX = shiftX.coerceIn(-maxShift, maxShift)
+        val clampedY = shiftY.coerceIn(-maxShift, maxShift)
+
+        if (abs(angleDeg) > 0.05f) {
+            matrix.postRotate(angleDeg)
+        }
+        matrix.postScale(totalZoom, totalZoom)
+        matrix.postTranslate(clampedX, clampedY)
+        return matrix
+    }
+
+    companion object {
+        fun analyzeWithHorizonLock(videoFile: File, radius: Int): List<FramePose> {
+            val retriever = MediaMetadataRetriever()
+            val rawPoses = mutableListOf<FramePose>()
+            try {
+                retriever.setDataSource(videoFile.absolutePath)
+                val durationMs = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                    ?.toLongOrNull() ?: return emptyList()
+
+                var prevLuma: IntArray? = null
+                var cumX = 0f
+                var cumY = 0f
+                var cumAngle = 0f
+                var timeMs = 0L
+                val stepMs = 120L
+
+                while (timeMs < durationMs) {
+                    val bmp = retriever.getFrameAtTime(
+                        timeMs * 1000L,
+                        MediaMetadataRetriever.OPTION_CLOSEST_SYNC
+                    ) ?: retriever.getFrameAtTime(timeMs * 1000L, MediaMetadataRetriever.OPTION_CLOSEST)
+
+                    if (bmp != null) {
+                        val small = Bitmap.createScaledBitmap(bmp, 96, 72, true)
+                        bmp.recycle()
+                        val currLuma = extractLuma(small)
+                        small.recycle()
+
+                        if (prevLuma != null) {
+                            val (lx, ly) = matchZone(prevLuma, currLuma, 96, 72, 12, 44)
+                            val (rx, ry) = matchZone(prevLuma, currLuma, 96, 72, 52, 84)
+                            cumX += (lx + rx) * 0.5f
+                            cumY += (ly + ry) * 0.5f
+                            val deltaY = (ry - ly) * 36f
+                            val dAngle = Math.toDegrees(atan2(deltaY.toDouble(), 40.0)).toFloat()
+                            cumAngle = (cumAngle + dAngle) * 0.96f
+                        }
+                        prevLuma = currLuma
+                    }
+                    rawPoses.add(FramePose(cumX, cumY, cumAngle))
+                    timeMs += stepMs
+                }
+            } catch (_: Exception) {
+                return emptyList()
+            } finally {
+                retriever.release()
+            }
+
+            return rawPoses.mapIndexed { i, cur ->
+                var sx = 0f
+                var sy = 0f
+                var sa = 0f
+                var count = 0
+                for (j in max(0, i - radius)..min(rawPoses.lastIndex, i + radius)) {
+                    sx += rawPoses[j].dx
+                    sy += rawPoses[j].dy
+                    sa += rawPoses[j].rollDeg
+                    count++
+                }
+                FramePose(
+                    dx = (sx / count) - cur.dx,
+                    dy = (sy / count) - cur.dy,
+                    rollDeg = ((sa / count) * 0.3f) - cur.rollDeg
+                )
+            }
+        }
+
+        private fun extractLuma(bmp: Bitmap): IntArray {
+            val w = bmp.width
+            val h = bmp.height
+            val px = IntArray(w * h)
+            bmp.getPixels(px, 0, w, 0, 0, w, h)
+            return IntArray(w * h) { idx ->
+                val p = px[idx]
+                (((p shr 16 and 0xFF) * 77) + ((p shr 8 and 0xFF) * 150) + ((p and 0xFF) * 29)) shr 8
+            }
+        }
+
+        private fun matchZone(
+            prev: IntArray,
+            curr: IntArray,
+            w: Int,
+            h: Int,
+            startX: Int,
+            endX: Int
+        ): Pair<Float, Float> {
+            var bestDx = 0
+            var bestDy = 0
+            var minSad = Int.MAX_VALUE
+            for (dy in -6..6) {
+                for (dx in -6..6) {
+                    var sad = 0
+                    for (y in 18 until h - 18 step 2) {
+                        for (x in startX until endX step 2) {
+                            sad += abs(prev[y * w + x] - curr[(y + dy) * w + (x + dx)])
+                        }
+                    }
+                    if (sad < minSad) {
+                        minSad = sad
+                        bestDx = dx
+                        bestDy = dy
+                    }
+                }
+            }
+            return Pair((bestDx.toFloat() / w) * 2f, -(bestDy.toFloat() / h) * 2f)
+        }
+    }
+}
+
+@OptIn(UnstableApi::class)
+class MetaCinemaGlEffect : GlEffect {
+    override fun toGlShaderProgram(context: Context, useHdr: Boolean): GlShaderProgram =
+        MetaCinemaShaderProgram(useHdr)
+}
+
+@OptIn(UnstableApi::class)
+class MetaCinemaShaderProgram(useHdr: Boolean) : BaseGlShaderProgram(useHdr, 1) {
+
+    private val glProgram: GlProgram = GlProgram(VERTEX_SHADER, FRAGMENT_SHADER).apply {
+        setBufferAttribute(
+            "aFramePosition",
+            floatArrayOf(
+                -1f, -1f, 0f, 1f,
+                 1f, -1f, 0f, 1f,
+                -1f,  1f, 0f, 1f,
+                 1f,  1f, 0f, 1f
+            ),
+            4
+        )
+    }
+
+    companion object {
+        private const val VERTEX_SHADER = """
+            attribute vec4 aFramePosition;
+            varying vec2 vTexSamplingCoord;
+            void main() {
+                gl_Position = aFramePosition;
+                vTexSamplingCoord = vec2(aFramePosition.x * 0.5 + 0.5, aFramePosition.y * 0.5 + 0.5);
+            }
+        """
+
+        private const val FRAGMENT_SHADER = """
+            precision highp float;
+            uniform sampler2D uTexSampler;
+            varying vec2 vTexSamplingCoord;
+
+            void main() {
+                vec2 texel = vec2(1.0 / 2048.0, 1.0 / 1536.0);
+                vec3 c = texture2D(uTexSampler, vTexSamplingCoord).rgb;
+                vec3 n = texture2D(uTexSampler, vTexSamplingCoord + vec2(0.0, -texel.y)).rgb;
+                vec3 s = texture2D(uTexSampler, vTexSamplingCoord + vec2(0.0,  texel.y)).rgb;
+                vec3 w = texture2D(uTexSampler, vTexSamplingCoord + vec2(-texel.x, 0.0)).rgb;
+                vec3 e = texture2D(uTexSampler, vTexSamplingCoord + vec2( texel.x, 0.0)).rgb;
+
+                vec3 minRGB = min(min(min(n, s), min(w, e)), c);
+                vec3 maxRGB = max(max(max(n, s), max(w, e)), c);
+                vec3 amp = clamp(min(minRGB, 1.0 - maxRGB) / max(maxRGB, vec3(0.0001)), 0.0, 1.0);
+                amp = sqrt(amp);
+                vec3 weight = amp * (-0.18);
+                vec3 sharpened = clamp((c + (n + s + w + e) * weight) / (1.0 + 4.0 * weight), 0.0, 1.0);
+
+                vec3 graded = vec3(sharpened.r * 1.04, sharpened.g * 0.97, sharpened.b * 1.02);
+                graded = clamp(graded, 0.0, 1.0);
+                graded = mix(graded, smoothstep(0.03, 0.97, graded), 0.35);
+
+                float luma = dot(graded, vec3(0.299, 0.587, 0.114));
+                float sat = max(graded.r, max(graded.g, graded.b)) - min(graded.r, min(graded.g, graded.b));
+                graded = mix(vec3(luma), graded, 1.0 + (0.28 * (1.0 - sat)));
+
+                gl_FragColor = vec4(clamp(graded, 0.0, 1.0), 1.0);
+            }
+        """
+    }
+
+    override fun configure(inputWidth: Int, inputHeight: Int): Size = Size(inputWidth, inputHeight)
+
+    override fun drawFrame(inputTexId: Int, presentationTimeUs: Long) {
+        glProgram.use()
+        glProgram.setSamplerTexIdUniform("uTexSampler", inputTexId, 0)
+        glProgram.bindAttributesAndUniforms()
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+    }
+
+    override fun release() {
+        super.release()
+        glProgram.delete()
+    }
+}
