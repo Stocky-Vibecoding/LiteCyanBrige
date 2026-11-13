@@ -1,6 +1,5 @@
 package com.fersaiyan.cyanbridge
 
-import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
@@ -12,7 +11,6 @@ import android.bluetooth.BluetoothProfile
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -27,42 +25,25 @@ import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.media.AudioDeviceInfo
-import android.media.AudioManager
 import android.media.MediaMetadataRetriever
 import android.media.ThumbnailUtils
-import android.media.ToneGenerator
-import android.media.session.MediaSession
-import android.media.session.PlaybackState
 import android.net.Uri
 import android.opengl.GLES20
 import android.os.Build
-import android.os.Bundle
 import android.os.CountDownTimer
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
 import android.provider.Settings
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
-import android.text.InputType
-import android.util.Base64
+import android.text.TextUtils
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
-import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
-import android.view.WindowManager
-import android.widget.Button
-import android.widget.EditText
 import android.widget.FrameLayout
-import android.widget.HorizontalScrollView
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
@@ -98,13 +79,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
-import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
-import java.net.HttpURLConnection
-import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -144,20 +121,14 @@ class OpenMetaManager(
     private val onScanClick: () -> Unit,
     private val onPhotoClick: () -> Unit,
     private val onVideoClick: () -> Unit,
-    private val onVisionPhotoRequest: () -> Unit
+    private val onVisionPhotoRequest: () -> Unit = {}
 ) {
     private val prefs = activity.getSharedPreferences("openmeta_ru_prefs", Context.MODE_PRIVATE)
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val audioManager = activity.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
     private val fontMedium = Typeface.create("sans-serif-medium", Typeface.NORMAL)
     private val fontBold = Typeface.create("sans-serif", Typeface.BOLD)
-
-    private var tts: TextToSpeech? = null
-    private var speechRecognizer: SpeechRecognizer? = null
-    private var mediaSession: MediaSession? = null
-    private var lastTriggerTimeMs = 0L
 
     private var rootMountContainer: FrameLayout? = null
     private var mainWrapperLayout: LinearLayout? = null
@@ -173,15 +144,14 @@ class OpenMetaManager(
 
     private var batteryTextView: TextView? = null
     private var batteryIconView: BatteryVectorView? = null
-    private var statusHintView: TextView? = null
     private var homeRecentGridContainer: LinearLayout? = null
 
     private var recordingCardLayout: LinearLayout? = null
     private var recordingTimerLabel: TextView? = null
     private var recordingProgressBar: ProgressBar? = null
-    private var pillVideoRecordBtn: TextView? = null
-    private var pillVideoLimitBtn: TextView? = null
-    private var pillCarAudioBtn: TextView? = null
+    private var btnVideoRecord: TextView? = null
+    private var btnVideoLimit: TextView? = null
+    private var btnCarAudio: TextView? = null
 
     private var transferBannerCard: LinearLayout? = null
     private var transferStatusTitle: TextView? = null
@@ -196,17 +166,14 @@ class OpenMetaManager(
     private var lastKnownConnected = false
     private var lastKnownBattery: Int? = null
 
-    var lastUserVisionQuery: String = "Коротко опиши, что перед пользователем на этом кадре."
-
-    private val visionTriggers = listOf(
-        "посмотри", "смотри", "глянь", "взгляни", "видишь",
-        "что это", "сто это", "че это", "чё это", "что тут",
-        "что здесь", "что за", "что перед", "кто это",
-        "прочитай", "переведи", "оцени", "сфоткай", "сфотай", "на фото", "покажи"
-    )
+    // Заглушки для совместимости со старыми вызовами в MainActivity.kt
+    var lastUserVisionQuery: String = ""
+    fun onTouchpadLongHold() {}
+    fun askGeminiDirect(prompt: String, imageBytes: ByteArray?): String = ""
+    fun speakRussian(text: String) {}
 
     var isDarkMode: Boolean
-        get() = prefs.getBoolean("meta_dark_mode", false)
+        get() = prefs.getBoolean("meta_dark_mode", true)
         set(value) {
             prefs.edit().putBoolean("meta_dark_mode", value).apply()
             rebuildMetaUi()
@@ -216,30 +183,15 @@ class OpenMetaManager(
         get() = prefs.getInt("video_duration_sec", 60)
         set(value) {
             prefs.edit().putInt("video_duration_sec", value).apply()
-            updateDurationPillUi()
+            updateDurationButtonUi()
         }
 
     var isGlassesMediaAudioEnabled: Boolean
         get() = prefs.getBoolean("glasses_media_audio_enabled", true)
         set(value) {
             prefs.edit().putBoolean("glasses_media_audio_enabled", value).apply()
-            updateAudioPillUi()
+            updateAudioButtonUi()
             applyGlassesA2dpRoute(value)
-        }
-
-    var geminiApiKey: String
-        get() = prefs.getString("gemini_api_key", "") ?: ""
-        set(value) {
-            prefs.edit().putString("gemini_api_key", value.trim()).apply()
-        }
-
-    var geminiBaseUrl: String
-        get() = prefs.getString("gemini_base_url", "https://generativelanguage.googleapis.com")
-            ?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }
-            ?: "https://generativelanguage.googleapis.com"
-        set(value) {
-            val clean = value.trim().trimEnd('/').ifEmpty { "https://generativelanguage.googleapis.com" }
-            prefs.edit().putString("gemini_base_url", clean).apply()
         }
 
     var currentRenderMode: OpenMetaRenderMode
@@ -252,59 +204,8 @@ class OpenMetaManager(
         get() = File(activity.filesDir, "openmeta_synced").apply { if (!exists()) mkdirs() }
 
     init {
-        tts = TextToSpeech(activity.applicationContext) { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                tts?.language = Locale("ru", "RU")
-                tts?.setSpeechRate(1.05f)
-                tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(utteranceId: String?) {}
-                    override fun onDone(utteranceId: String?) {
-                        if (!isGlassesMediaAudioEnabled) stopGlassesVoiceCallChannel()
-                    }
-                    override fun onError(utteranceId: String?) {
-                        if (!isGlassesMediaAudioEnabled) stopGlassesVoiceCallChannel()
-                    }
-                })
-            }
-        }
-        setupMediaSessionInterceptor()
         if (!isGlassesMediaAudioEnabled) {
             mainHandler.postDelayed({ applyGlassesA2dpRoute(false) }, 1200)
-        }
-    }
-
-    private fun setupMediaSessionInterceptor() {
-        runCatching {
-            mediaSession = MediaSession(activity, "OpenMetaSession").apply {
-                setPlaybackState(
-                    PlaybackState.Builder()
-                        .setActions(
-                            PlaybackState.ACTION_PLAY or
-                                PlaybackState.ACTION_PAUSE or
-                                PlaybackState.ACTION_PLAY_PAUSE
-                        )
-                        .setState(PlaybackState.STATE_PAUSED, 0L, 1f)
-                        .build()
-                )
-                setCallback(object : MediaSession.Callback() {
-                    override fun onMediaButtonEvent(mediaButtonIntent: Intent): Boolean {
-                        val event = mediaButtonIntent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
-                        if (event != null && event.action == KeyEvent.ACTION_DOWN) {
-                            when (event.keyCode) {
-                                KeyEvent.KEYCODE_VOICE_ASSIST,
-                                KeyEvent.KEYCODE_ASSIST,
-                                KeyEvent.KEYCODE_HEADSETHOOK,
-                                KeyEvent.KEYCODE_CALL -> {
-                                    onTouchpadLongHold()
-                                    return true
-                                }
-                            }
-                        }
-                        return super.onMediaButtonEvent(mediaButtonIntent)
-                    }
-                })
-                isActive = true
-            }
         }
     }
 
@@ -425,40 +326,7 @@ class OpenMetaManager(
         }
     }
 
-    private fun startGlassesVoiceCallChannel() {
-        runCatching {
-            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                val btVoiceDevice = audioManager.availableCommunicationDevices.firstOrNull {
-                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
-                        it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
-                }
-                if (btVoiceDevice != null) {
-                    audioManager.setCommunicationDevice(btVoiceDevice)
-                    return
-                }
-            }
-            @Suppress("DEPRECATION")
-            audioManager.startBluetoothSco()
-            @Suppress("DEPRECATION")
-            audioManager.isBluetoothScoOn = true
-        }
-    }
-
-    private fun stopGlassesVoiceCallChannel() {
-        runCatching {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                audioManager.clearCommunicationDevice()
-            }
-            @Suppress("DEPRECATION")
-            audioManager.isBluetoothScoOn = false
-            @Suppress("DEPRECATION")
-            audioManager.stopBluetoothSco()
-            audioManager.mode = AudioManager.MODE_NORMAL
-        }
-    }
-
-    // ================= ИНИЦИАЛИЗАЦИЯ И ПОСТРОЕНИЕ ИНТЕРФЕЙСА OPENMETA =================
+    // ================= ПОСТРОЕНИЕ ИНТЕРФЕЙСА OPENMETA =================
 
     fun attachRussianMetaUi() {
         val mount = FrameLayout(activity).apply {
@@ -476,10 +344,6 @@ class OpenMetaManager(
             )
         )
         rebuildMetaUi()
-
-        if (!prefs.getBoolean("onboarding_completed", false)) {
-            mainHandler.postDelayed({ showFirstLaunchOnboardingDialog() }, 350)
-        }
     }
 
     private fun rebuildMetaUi() {
@@ -489,7 +353,7 @@ class OpenMetaManager(
         val dark = isDarkMode
         val bgPage = if (dark) "#0B0D12" else "#F4F6F9"
         val bgCard = if (dark) "#151821" else "#FFFFFF"
-        val bgPill = if (dark) "#1C202B" else "#FFFFFF"
+        val bgBtn = if (dark) "#1C202B" else "#FFFFFF"
         val textPrimary = if (dark) "#F3F4F6" else "#111827"
         val textSecondary = if (dark) "#9CA3AF" else "#6B7280"
         val strokeSubtle = if (dark) "#262B38" else "#E5E7EB"
@@ -505,27 +369,27 @@ class OpenMetaManager(
         }
         mainWrapperLayout = mainWrapper
 
+        // ВЕРХНЯЯ ШАПКА
         val topBar = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(20), dp(42), dp(20), dp(12))
+            setPadding(dp(16), dp(28), dp(16), dp(10))
         }
 
         val headerTitle = TextView(activity).apply {
             text = "OpenMeta"
             setTextColor(Color.parseColor(textPrimary))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 25f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 20f)
             typeface = fontBold
-            letterSpacing = -0.02f
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
 
         val btnAddDevice = FrameLayout(activity).apply {
             background = circleBg(bgCard, strokeSubtle)
-            layoutParams = LinearLayout.LayoutParams(dp(38), dp(38)).apply { rightMargin = dp(10) }
+            layoutParams = LinearLayout.LayoutParams(dp(34), dp(34)).apply { rightMargin = dp(8) }
             addView(
                 VectorIconView(activity, VectorIconView.TYPE_PLUS, Color.parseColor(textPrimary)).apply {
-                    layoutParams = FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER)
+                    layoutParams = FrameLayout.LayoutParams(dp(15), dp(15), Gravity.CENTER)
                 }
             )
             setOnClickListener {
@@ -536,14 +400,14 @@ class OpenMetaManager(
 
         val btnThemeToggle = FrameLayout(activity).apply {
             background = circleBg(bgCard, strokeSubtle)
-            layoutParams = LinearLayout.LayoutParams(dp(38), dp(38))
+            layoutParams = LinearLayout.LayoutParams(dp(34), dp(34))
             addView(
                 VectorIconView(
                     activity,
                     if (dark) VectorIconView.TYPE_SUN else VectorIconView.TYPE_MOON,
                     Color.parseColor(textPrimary)
                 ).apply {
-                    layoutParams = FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER)
+                    layoutParams = FrameLayout.LayoutParams(dp(15), dp(15), Gravity.CENTER)
                 }
             )
             setOnClickListener { isDarkMode = !dark }
@@ -558,18 +422,19 @@ class OpenMetaManager(
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         }
 
-        homeTabContainer = buildHomeTab(dark, bgCard, bgPill, textPrimary, textSecondary, strokeSubtle, metaBlue)
+        homeTabContainer = buildHomeTab(dark, bgCard, bgBtn, textPrimary, textSecondary, strokeSubtle, metaBlue)
         mediaTabContainer = buildMediaTab(dark, bgCard, textPrimary, textSecondary, strokeSubtle, metaBlue)
 
         pagesFrame.addView(homeTabContainer)
         pagesFrame.addView(mediaTabContainer)
         mainWrapper.addView(pagesFrame)
 
+        // НИЖНЯЯ ПАНЕЛЬ НА 2 ВКЛАДКИ (Устройства | Медиа)
         val bottomNav = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             background = roundedBg(bgCard, 0f, strokeSubtle)
-            setPadding(dp(16), dp(8), dp(16), dp(12))
+            setPadding(dp(12), dp(6), dp(12), dp(10))
         }
 
         val tabHomeBox = LinearLayout(activity).apply {
@@ -580,13 +445,13 @@ class OpenMetaManager(
             setOnClickListener { switchTab(0) }
         }
         bottomTabHomeIcon = VectorIconView(activity, VectorIconView.TYPE_GLASSES, Color.parseColor(metaBlue)).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(24), dp(20))
+            layoutParams = LinearLayout.LayoutParams(dp(22), dp(18))
         }
         bottomTabHomeLabel = TextView(activity).apply {
             text = "Устройства"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             typeface = fontMedium
-            setPadding(0, dp(3), 0, 0)
+            setPadding(0, dp(2), 0, 0)
         }
         tabHomeBox.addView(bottomTabHomeIcon)
         tabHomeBox.addView(bottomTabHomeLabel)
@@ -599,13 +464,13 @@ class OpenMetaManager(
             setOnClickListener { switchTab(1) }
         }
         bottomTabMediaIcon = VectorIconView(activity, VectorIconView.TYPE_GRID, Color.parseColor(textSecondary)).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(20), dp(20))
+            layoutParams = LinearLayout.LayoutParams(dp(18), dp(18))
         }
         bottomTabMediaLabel = TextView(activity).apply {
             text = "Медиа"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             typeface = fontMedium
-            setPadding(0, dp(3), 0, 0)
+            setPadding(0, dp(2), 0, 0)
         }
         tabMediaBox.addView(bottomTabMediaIcon)
         tabMediaBox.addView(bottomTabMediaLabel)
@@ -617,18 +482,18 @@ class OpenMetaManager(
         val backBtn = TextView(activity).apply {
             text = "Вернуться в OpenMeta"
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             typeface = fontMedium
             visibility = View.GONE
-            background = roundedBg(metaBlue, 22f)
-            setPadding(dp(18), dp(10), dp(18), dp(10))
+            background = roundedBg(metaBlue, 20f)
+            setPadding(dp(16), dp(9), dp(16), dp(9))
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.BOTTOM or Gravity.END
             ).apply {
-                bottomMargin = dp(86)
-                rightMargin = dp(18)
+                bottomMargin = dp(82)
+                rightMargin = dp(16)
             }
             setOnClickListener {
                 mainWrapper.visibility = View.VISIBLE
@@ -670,7 +535,7 @@ class OpenMetaManager(
     private fun buildHomeTab(
         dark: Boolean,
         bgCard: String,
-        bgPill: String,
+        bgBtn: String,
         textPrimary: String,
         textSecondary: String,
         strokeSubtle: String,
@@ -687,13 +552,14 @@ class OpenMetaManager(
 
         val content = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(6), dp(20), dp(24))
+            setPadding(dp(16), dp(4), dp(16), dp(20))
         }
 
+        // КАРТОЧКА ОЧКОВ (без клика на картинку очков и без надписи про ИИ)
         val heroCard = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(22), dp(20), dp(22), dp(18))
-            background = roundedBg(bgCard, 24f, strokeSubtle)
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            background = roundedBg(bgCard, 18f, strokeSubtle)
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -711,19 +577,18 @@ class OpenMetaManager(
         }
 
         val brandRow = TextView(activity).apply {
-            text = "Ray-Ban  |  Meta"
+            text = "Ray-Ban | Meta"
             setTextColor(Color.parseColor(textSecondary))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             typeface = fontMedium
-            letterSpacing = 0.03f
         }
 
         val modelTitle = TextView(activity).apply {
             text = "Wayfarer"
             setTextColor(Color.parseColor(textPrimary))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
             typeface = fontBold
-            setPadding(0, dp(2), 0, dp(6))
+            setPadding(0, dp(1), 0, dp(4))
         }
 
         val batteryRow = LinearLayout(activity).apply {
@@ -732,13 +597,13 @@ class OpenMetaManager(
         }
 
         batteryIconView = BatteryVectorView(activity, Color.parseColor(textPrimary)).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(22), dp(12)).apply { rightMargin = dp(6) }
+            layoutParams = LinearLayout.LayoutParams(dp(20), dp(11)).apply { rightMargin = dp(6) }
         }
 
         batteryTextView = TextView(activity).apply {
             text = "Не подключено"
             setTextColor(Color.parseColor(textPrimary))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             typeface = fontMedium
         }
 
@@ -750,36 +615,39 @@ class OpenMetaManager(
         heroLeftCol.addView(batteryRow)
 
         val gearBtn = FrameLayout(activity).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(36), dp(36))
+            layoutParams = LinearLayout.LayoutParams(dp(32), dp(32))
             addView(
                 VectorIconView(activity, VectorIconView.TYPE_GEAR, Color.parseColor(textSecondary)).apply {
-                    layoutParams = FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER)
+                    layoutParams = FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER)
                 }
             )
-            setOnClickListener { showUnifiedSettingsDialog() }
+            setOnClickListener { showSettingsDialog() }
         }
 
         heroTopRow.addView(heroLeftCol)
         heroTopRow.addView(gearBtn)
         heroCard.addView(heroTopRow)
 
+        // Компактная иллюстрация очков по центру (без обработчика нажатия)
         val glassesDrawing = WayfarerGlassesView(activity, dark).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(118)
+                dp(82)
             ).apply {
-                topMargin = dp(8)
-                bottomMargin = dp(6)
+                topMargin = dp(4)
+                bottomMargin = dp(2)
             }
-            setOnClickListener { startSyncAndOpenMediaTab() }
+            isClickable = false
+            isFocusable = false
         }
         heroCard.addView(glassesDrawing)
 
+        // Плашка активной записи видео с таймером и кнопкой «Остановить»
         recordingCardLayout = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             visibility = if (isRecordingVideo) View.VISIBLE else View.GONE
-            background = roundedBg(if (dark) "#2A1519" else "#FEF2F2", 16f, "#EF4444")
-            setPadding(dp(16), dp(12), dp(16), dp(12))
+            background = roundedBg(if (dark) "#2A1519" else "#FEF2F2", 12f, "#EF4444")
+            setPadding(dp(12), dp(10), dp(12), dp(10))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -792,9 +660,9 @@ class OpenMetaManager(
         }
 
         recordingTimerLabel = TextView(activity).apply {
-            text = "Идет запись • Осталось 01:00"
+            text = "Запись • 01:00"
             setTextColor(Color.parseColor("#EF4444"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             typeface = fontBold
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
@@ -802,10 +670,10 @@ class OpenMetaManager(
         val stopRecBtn = TextView(activity).apply {
             text = "Остановить"
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             typeface = fontMedium
-            background = roundedBg("#EF4444", 10f)
-            setPadding(dp(12), dp(6), dp(12), dp(6))
+            background = roundedBg("#EF4444", 8f)
+            setPadding(dp(10), dp(5), dp(10), dp(5))
             setOnClickListener { stopVideoRecordingWithTimer() }
         }
 
@@ -817,151 +685,122 @@ class OpenMetaManager(
             progress = 1000
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(6)
-            ).apply { topMargin = dp(8) }
+                dp(4)
+            ).apply { topMargin = dp(6) }
         }
 
         recordingCardLayout?.addView(recHeaderRow)
         recordingCardLayout?.addView(recordingProgressBar)
         heroCard.addView(recordingCardLayout)
-
-        statusHintView = TextView(activity).apply {
-            text = "Удержание дужки активирует голосовой ассистент"
-            gravity = Gravity.CENTER
-            setTextColor(Color.parseColor(textSecondary))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setPadding(0, dp(4), 0, 0)
-        }
-        heroCard.addView(statusHintView)
         content.addView(heroCard)
 
-        val pillsScroll = HorizontalScrollView(activity).apply {
-            isHorizontalScrollBarEnabled = false
+        // СЕТКА КНОПОК 2x2 ВО ВСЮ ШИРИНУ ЭКРАНА (без прокрутки и без бутафорских точек)
+        fun createGridActionBtn(): TextView {
+            return TextView(activity).apply {
+                gravity = Gravity.CENTER
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                typeface = fontMedium
+                setSingleLine(true)
+                ellipsize = TextUtils.TruncateAt.END
+                setPadding(dp(10), 0, dp(10), 0)
+            }
+        }
+
+        val gridRow1 = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(14) }
+            ).apply { topMargin = dp(10) }
         }
 
-        val pillsRow = LinearLayout(activity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-
-        fun stylePill(tv: TextView) {
-            tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            tv.typeface = fontMedium
-            tv.setPadding(dp(16), dp(11), dp(16), dp(11))
-            tv.layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { rightMargin = dp(8) }
-        }
-
-        pillCarAudioBtn = TextView(activity).apply {
-            stylePill(this)
+        btnCarAudio = createGridActionBtn().apply {
+            layoutParams = LinearLayout.LayoutParams(0, dp(42), 1f).apply { rightMargin = dp(5) }
             setOnClickListener {
                 isGlassesMediaAudioEnabled = !isGlassesMediaAudioEnabled
                 val msg = if (isGlassesMediaAudioEnabled) {
-                    "Аудио медиа направлено через очки"
+                    "Звук медиа: через очки"
                 } else {
-                    "Режим Авто: музыка идет на внешнее устройство, ИИ и звонки — в очках"
+                    "Режим Авто: музыка идет на авто/телефон"
                 }
                 Toast.makeText(activity, msg, Toast.LENGTH_SHORT).show()
             }
-        }
-
-        pillVideoRecordBtn = TextView(activity).apply {
-            stylePill(this)
-            setOnClickListener {
-                if (isRecordingVideo) stopVideoRecordingWithTimer() else startVideoRecordingWithTimer()
+            setOnLongClickListener {
+                runCatching { activity.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) }
+                true
             }
         }
 
-        pillVideoLimitBtn = TextView(activity).apply {
-            stylePill(this)
-            setTextColor(Color.parseColor(textPrimary))
-            background = roundedBg(bgPill, 20f, strokeSubtle)
-            setOnClickListener { showVideoDurationDialog() }
-        }
-
-        val pillPhotoBtn = TextView(activity).apply {
-            stylePill(this)
+        val btnTakePhoto = createGridActionBtn().apply {
             text = "Сделать фото"
             setTextColor(Color.parseColor(textPrimary))
-            background = roundedBg(bgPill, 20f, strokeSubtle)
+            background = roundedBg(bgBtn, 12f, strokeSubtle)
+            layoutParams = LinearLayout.LayoutParams(0, dp(42), 1f).apply { leftMargin = dp(5) }
             setOnClickListener {
                 releaseStuckCommandSlotIfIdle()
                 onPhotoClick()
             }
         }
 
-        val pillSyncBtn = TextView(activity).apply {
-            stylePill(this)
-            text = "Перенести медиа"
-            setTextColor(Color.parseColor(textPrimary))
-            background = roundedBg(bgPill, 20f, strokeSubtle)
-            setOnClickListener { startSyncAndOpenMediaTab() }
-        }
+        gridRow1.addView(btnCarAudio)
+        gridRow1.addView(btnTakePhoto)
+        content.addView(gridRow1)
 
-        pillsRow.addView(pillCarAudioBtn)
-        pillsRow.addView(pillVideoRecordBtn)
-        pillsRow.addView(pillVideoLimitBtn)
-        pillsRow.addView(pillPhotoBtn)
-        pillsRow.addView(pillSyncBtn)
-        pillsScroll.addView(pillsRow)
-        content.addView(pillsScroll)
-
-        updateAudioPillUi()
-        updateDurationPillUi()
-        updateRecordButtonVisual()
-
-        val dotsRow = LinearLayout(activity).apply {
+        val gridRow2 = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply {
-                topMargin = dp(14)
+                topMargin = dp(8)
                 bottomMargin = dp(16)
             }
         }
-        dotsRow.addView(View(activity).apply {
-            background = roundedBg(metaBlue, 4f)
-            layoutParams = LinearLayout.LayoutParams(dp(16), dp(5)).apply { rightMargin = dp(5) }
-        })
-        dotsRow.addView(View(activity).apply {
-            background = roundedBg(if (dark) "#374151" else "#D1D5DB", 4f)
-            layoutParams = LinearLayout.LayoutParams(dp(5), dp(5)).apply { rightMargin = dp(5) }
-        })
-        dotsRow.addView(View(activity).apply {
-            background = roundedBg(if (dark) "#374151" else "#D1D5DB", 4f)
-            layoutParams = LinearLayout.LayoutParams(dp(5), dp(5))
-        })
-        content.addView(dotsRow)
 
+        btnVideoRecord = createGridActionBtn().apply {
+            layoutParams = LinearLayout.LayoutParams(0, dp(42), 1f).apply { rightMargin = dp(5) }
+            setOnClickListener {
+                if (isRecordingVideo) stopVideoRecordingWithTimer() else startVideoRecordingWithTimer()
+            }
+        }
+
+        btnVideoLimit = createGridActionBtn().apply {
+            setTextColor(Color.parseColor(textPrimary))
+            background = roundedBg(bgBtn, 12f, strokeSubtle)
+            layoutParams = LinearLayout.LayoutParams(0, dp(42), 1f).apply { leftMargin = dp(5) }
+            setOnClickListener { showVideoDurationDialog() }
+        }
+
+        gridRow2.addView(btnVideoRecord)
+        gridRow2.addView(btnVideoLimit)
+        content.addView(gridRow2)
+
+        updateAudioButtonUi()
+        updateDurationButtonUi()
+        updateRecordButtonVisual()
+
+        // БЛОК НЕДАВНИХ МЕДИА
         val galleryHeader = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(10) }
+            ).apply { bottomMargin = dp(8) }
         }
 
         val galleryTitle = TextView(activity).apply {
             text = "Недавние медиа"
             setTextColor(Color.parseColor(textPrimary))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 18f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             typeface = fontBold
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
 
         val seeAllLink = TextView(activity).apply {
-            text = "Открыть все  >"
+            text = "Открыть все >"
             setTextColor(Color.parseColor(textSecondary))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             typeface = fontMedium
             setOnClickListener { switchTab(1) }
         }
@@ -972,7 +811,7 @@ class OpenMetaManager(
 
         val recentCard = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
-            background = roundedBg(bgCard, 20f, strokeSubtle)
+            background = roundedBg(bgCard, 16f, strokeSubtle)
             setPadding(dp(6), dp(6), dp(6), dp(6))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -1007,17 +846,17 @@ class OpenMetaManager(
 
         val content = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(6), dp(20), dp(24))
+            setPadding(dp(16), dp(4), dp(16), dp(20))
         }
 
         transferBannerCard = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
-            background = roundedBg(bgCard, 20f, strokeSubtle)
-            setPadding(dp(18), dp(16), dp(18), dp(16))
+            background = roundedBg(bgCard, 16f, strokeSubtle)
+            setPadding(dp(14), dp(14), dp(14), dp(14))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(16) }
+            ).apply { bottomMargin = dp(14) }
         }
 
         val transferTopRow = LinearLayout(activity).apply {
@@ -1033,15 +872,15 @@ class OpenMetaManager(
         transferStatusTitle = TextView(activity).apply {
             text = "Перенос медиа с очков"
             setTextColor(Color.parseColor(textPrimary))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             typeface = fontBold
         }
 
         transferStatusSubtitle = TextView(activity).apply {
-            text = "Файлы загружаются сюда для просмотра и выбора обработки перед сохранением в Галерею"
+            text = "Нажмите «Перенести», чтобы загрузить фото и видео с очков"
             setTextColor(Color.parseColor(textSecondary))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setPadding(0, dp(3), dp(10), 0)
+            setPadding(0, dp(2), dp(8), 0)
         }
 
         transferTextCol.addView(transferStatusTitle)
@@ -1050,10 +889,10 @@ class OpenMetaManager(
         val startSyncBtn = TextView(activity).apply {
             text = "Перенести"
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             typeface = fontMedium
-            background = roundedBg(metaBlue, 14f)
-            setPadding(dp(16), dp(10), dp(16), dp(10))
+            background = roundedBg(metaBlue, 12f)
+            setPadding(dp(14), dp(9), dp(14), dp(9))
             setOnClickListener {
                 releaseStuckCommandSlotIfIdle()
                 transferProgressBar?.visibility = View.VISIBLE
@@ -1073,8 +912,8 @@ class OpenMetaManager(
             visibility = View.GONE
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(6)
-            ).apply { topMargin = dp(12) }
+                dp(5)
+            ).apply { topMargin = dp(10) }
         }
 
         transferBannerCard?.addView(transferTopRow)
@@ -1082,17 +921,17 @@ class OpenMetaManager(
         content.addView(transferBannerCard)
 
         val gridSectionTitle = TextView(activity).apply {
-            text = "Перенесенные файлы"
+            text = "Файлы с очков"
             setTextColor(Color.parseColor(textPrimary))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 17f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             typeface = fontBold
-            setPadding(0, 0, 0, dp(10))
+            setPadding(0, 0, 0, dp(8))
         }
         content.addView(gridSectionTitle)
 
         val fullGridCard = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
-            background = roundedBg(bgCard, 20f, strokeSubtle)
+            background = roundedBg(bgCard, 16f, strokeSubtle)
             setPadding(dp(6), dp(6), dp(6), dp(6))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -1104,16 +943,6 @@ class OpenMetaManager(
 
         scroll.addView(content)
         return scroll
-    }
-
-    private fun startSyncAndOpenMediaTab() {
-        switchTab(1)
-        releaseStuckCommandSlotIfIdle()
-        transferProgressBar?.visibility = View.VISIBLE
-        transferProgressBar?.isIndeterminate = true
-        transferStatusTitle?.text = "Подключение к очкам по Wi-Fi..."
-        transferStatusSubtitle?.text = "Подготовка к переносу медиафайлов"
-        onSyncClick()
     }
 
     fun saveIncomingFileFromGlasses(
@@ -1172,7 +1001,7 @@ class OpenMetaManager(
                 transferProgressBar?.visibility = View.GONE
                 transferStatusTitle?.text = "Перенос завершен"
                 val mb = String.format(Locale.US, "%.1f МБ", copiedBytes / (1024f * 1024f))
-                transferStatusSubtitle?.text = "Загружен $cleanName ($mb). Нажмите на превью ниже для просмотра и 2K-обработки."
+                transferStatusSubtitle?.text = "Загружен $cleanName ($mb). Нажмите на превью ниже для просмотра и обработки."
                 refreshAllMediaGrids()
             }
             targetFile
@@ -1246,18 +1075,18 @@ class OpenMetaManager(
         container.removeAllViews()
         if (items.isEmpty()) {
             val emptyLabel = TextView(activity).apply {
-                text = "Нет перенесенных файлов.\nНажмите «Перенести медиа», чтобы загрузить фото и видео с очков."
+                text = "Нет перенесенных файлов.\nПерейдите во вкладку «Медиа» для загрузки с очков."
                 gravity = Gravity.CENTER
                 setTextColor(Color.parseColor(textSec))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-                setPadding(dp(20), dp(28), dp(20), dp(28))
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+                setPadding(dp(16), dp(22), dp(16), dp(22))
             }
             container.addView(emptyLabel)
             return
         }
 
         val screenWidth = activity.resources.displayMetrics.widthPixels
-        val cellSide = ((screenWidth - dp(64)) / 4).coerceAtLeast(dp(70))
+        val cellSide = ((screenWidth - dp(56)) / 4).coerceAtLeast(dp(64))
         val rowCount = (items.size + 3) / 4
 
         for (r in 0 until rowCount) {
@@ -1277,7 +1106,7 @@ class OpenMetaManager(
                     layoutParams = LinearLayout.LayoutParams(0, cellSide, 1f).apply {
                         if (c < 3) rightMargin = dp(4)
                     }
-                    background = roundedBg(cellBg, 10f)
+                    background = roundedBg(cellBg, 8f)
                     clipToOutline = true
                 }
 
@@ -1300,17 +1129,17 @@ class OpenMetaManager(
                         val durBadge = TextView(activity).apply {
                             text = String.format(Locale.US, "%d:%02d", totalSec / 60L, totalSec % 60L)
                             setTextColor(Color.WHITE)
-                            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+                            setTextSize(TypedValue.COMPLEX_UNIT_SP, 9f)
                             typeface = fontMedium
-                            setPadding(dp(5), dp(2), dp(5), dp(2))
-                            background = roundedBg("#99000000", 5f)
+                            setPadding(dp(4), dp(1), dp(4), dp(1))
+                            background = roundedBg("#99000000", 4f)
                             layoutParams = FrameLayout.LayoutParams(
                                 ViewGroup.LayoutParams.WRAP_CONTENT,
                                 ViewGroup.LayoutParams.WRAP_CONTENT,
                                 Gravity.BOTTOM or Gravity.END
                             ).apply {
-                                bottomMargin = dp(4)
-                                rightMargin = dp(4)
+                                bottomMargin = dp(3)
+                                rightMargin = dp(3)
                             }
                         }
                         cellFrame.addView(durBadge)
@@ -1364,25 +1193,25 @@ class OpenMetaManager(
 
         val root = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
-            background = roundedBg(bgDialog, 22f, strokeSubtle)
-            setPadding(dp(18), dp(18), dp(18), dp(18))
+            background = roundedBg(bgDialog, 18f, strokeSubtle)
+            setPadding(dp(16), dp(16), dp(16), dp(16))
         }
 
         val titleView = TextView(activity).apply {
             text = item.file.name
             setTextColor(Color.parseColor(textPrimary))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
             typeface = fontBold
-            setPadding(0, 0, 0, dp(12))
+            setPadding(0, 0, 0, dp(10))
         }
         root.addView(titleView)
 
         val previewFrame = FrameLayout(activity).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(250)
-            ).apply { bottomMargin = dp(14) }
-            background = roundedBg("#000000", 14f)
+                dp(230)
+            ).apply { bottomMargin = dp(12) }
+            background = roundedBg("#000000", 12f)
             clipToOutline = true
         }
 
@@ -1416,10 +1245,10 @@ class OpenMetaManager(
         root.addView(previewFrame)
 
         val renderStatusText = TextView(activity).apply {
-            text = if (item.isVideo) "Выберите режим обработки для сохранения в Галерею:" else "Сохранение фото в Галерею:"
+            text = if (item.isVideo) "Выберите режим обработки перед сохранением в Галерею:" else "Сохранение фото в Галерею:"
             setTextColor(Color.parseColor(textSecondary))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setPadding(0, 0, 0, dp(8))
+            setPadding(0, 0, 0, dp(6))
         }
         root.addView(renderStatusText)
 
@@ -1428,8 +1257,8 @@ class OpenMetaManager(
             visibility = View.GONE
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(6)
-            ).apply { bottomMargin = dp(12) }
+                dp(5)
+            ).apply { bottomMargin = dp(10) }
         }
         root.addView(renderProgress)
 
@@ -1448,14 +1277,14 @@ class OpenMetaManager(
                 text = label
                 gravity = Gravity.CENTER
                 setTextColor(Color.parseColor(txtCol))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
                 typeface = fontMedium
-                background = roundedBg(bg, 14f)
-                setPadding(dp(14), dp(12), dp(14), dp(12))
+                background = roundedBg(bg, 12f)
+                setPadding(dp(12), dp(11), dp(12), dp(11))
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { bottomMargin = dp(8) }
+                ).apply { bottomMargin = dp(6) }
                 setOnClickListener { onClick() }
             }
         }
@@ -1484,7 +1313,7 @@ class OpenMetaManager(
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(4) }
+            ).apply { topMargin = dp(2) }
         }
 
         val deleteBtn = actionButton("Удалить", isPrimary = false, isDanger = true) {
@@ -1494,14 +1323,14 @@ class OpenMetaManager(
             refreshAllMediaGrids()
             Toast.makeText(activity, "Файл удален", Toast.LENGTH_SHORT).show()
         }.apply {
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(6) }
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(5) }
         }
 
         val closeBtn = actionButton("Закрыть", isPrimary = false) {
             runCatching { videoViewRef?.stopPlayback() }
             dialog.dismiss()
         }.apply {
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(6) }
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(5) }
         }
 
         bottomRow.addView(deleteBtn)
@@ -1617,46 +1446,46 @@ class OpenMetaManager(
         }
     }
 
-    // ================= ЗАПИСЬ ВИДЕО ДО 12 МИНУТ С ТАЙМЕРОМ И ОСТАНОВКОЙ =================
+    // ================= УПРАВЛЕНИЕ КНОПКАМИ И ЗАПИСЬЮ ВИДЕО (ДО 12 МИНУТ) =================
 
-    private fun updateAudioPillUi() {
+    private fun updateAudioButtonUi() {
         val dark = isDarkMode
-        val bgPill = if (dark) "#1C202B" else "#FFFFFF"
+        val bgBtn = if (dark) "#1C202B" else "#FFFFFF"
         val textPrimary = if (dark) "#F3F4F6" else "#111827"
         val strokeSubtle = if (dark) "#262B38" else "#E5E7EB"
 
         if (isGlassesMediaAudioEnabled) {
-            pillCarAudioBtn?.text = "Аудио: Очки"
-            pillCarAudioBtn?.setTextColor(Color.parseColor(textPrimary))
-            pillCarAudioBtn?.background = roundedBg(bgPill, 20f, strokeSubtle)
+            btnCarAudio?.text = "Аудио: Очки"
+            btnCarAudio?.setTextColor(Color.parseColor(textPrimary))
+            btnCarAudio?.background = roundedBg(bgBtn, 12f, strokeSubtle)
         } else {
-            pillCarAudioBtn?.text = "Режим Авто (Без музыки)"
-            pillCarAudioBtn?.setTextColor(Color.WHITE)
-            pillCarAudioBtn?.background = roundedBg("#0064E0", 20f)
+            btnCarAudio?.text = "Режим Авто"
+            btnCarAudio?.setTextColor(Color.WHITE)
+            btnCarAudio?.background = roundedBg("#0064E0", 12f)
         }
     }
 
-    private fun updateDurationPillUi() {
+    private fun updateDurationButtonUi() {
         val sec = selectedVideoDurationSec
         val label = if (sec < 60) "$sec сек" else "${sec / 60} мин"
-        pillVideoLimitBtn?.text = "Длина видео: $label"
+        btnVideoLimit?.text = "Лимит: $label"
     }
 
     private fun updateRecordButtonVisual() {
         val dark = isDarkMode
-        val bgPill = if (dark) "#1C202B" else "#FFFFFF"
+        val bgBtn = if (dark) "#1C202B" else "#FFFFFF"
         val textPrimary = if (dark) "#F3F4F6" else "#111827"
         val strokeSubtle = if (dark) "#262B38" else "#E5E7EB"
 
         if (isRecordingVideo) {
-            pillVideoRecordBtn?.text = "Остановить запись"
-            pillVideoRecordBtn?.setTextColor(Color.WHITE)
-            pillVideoRecordBtn?.background = roundedBg("#EF4444", 20f)
+            btnVideoRecord?.text = "Стоп запись"
+            btnVideoRecord?.setTextColor(Color.WHITE)
+            btnVideoRecord?.background = roundedBg("#EF4444", 12f)
             recordingCardLayout?.visibility = View.VISIBLE
         } else {
-            pillVideoRecordBtn?.text = "Запись видео"
-            pillVideoRecordBtn?.setTextColor(Color.parseColor(textPrimary))
-            pillVideoRecordBtn?.background = roundedBg(bgPill, 20f, strokeSubtle)
+            btnVideoRecord?.text = "Запись видео"
+            btnVideoRecord?.setTextColor(Color.parseColor(textPrimary))
+            btnVideoRecord?.background = roundedBg(bgBtn, 12f, strokeSubtle)
             recordingCardLayout?.visibility = View.GONE
         }
     }
@@ -1722,7 +1551,6 @@ class OpenMetaManager(
         }
         isRecordingVideo = false
         updateRecordButtonVisual()
-        statusHintView?.text = "Запись завершена. Нажмите «Перенести медиа», чтобы загрузить видео."
     }
 
     fun updateStatusUi(connected: Boolean, battery: Int?) {
@@ -1736,7 +1564,7 @@ class OpenMetaManager(
 
             batteryIconView?.updateLevel(pct, isOnline)
             batteryTextView?.text = if (isOnline) {
-                "${lastKnownBattery?.let { "$it%" } ?: "Подключено"}"
+                lastKnownBattery?.let { "$it%" } ?: "Подключено"
             } else {
                 "Не подключено"
             }
@@ -1747,419 +1575,42 @@ class OpenMetaManager(
         }
     }
 
-    // ================= ЕДИНОЕ ОКНО НАСТРОЕК (АССИСТЕНТ + ТЕСТЫ + ПЕРЕХОД В СТОК) =================
+    // ================= МЕНЮ НАСТРОЕК (ШЕСТЕРЕНКА) =================
 
-    private fun showUnifiedSettingsDialog() {
-        val container = LinearLayout(activity).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(14), dp(20), dp(8))
-        }
-
-        val keyLabel = TextView(activity).apply {
-            text = "API-ключ Google Gemini"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            typeface = fontMedium
-        }
-        val keyInput = EditText(activity).apply {
-            hint = "AIzaSy..."
-            setText(geminiApiKey)
-            inputType = InputType.TYPE_CLASS_TEXT
-            setSingleLine(true)
-        }
-
-        val proxyLabel = TextView(activity).apply {
-            text = "Адрес сервера API (или прокси для работы без VPN)"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            typeface = fontMedium
-            setPadding(0, dp(10), 0, 0)
-        }
-        val proxyInput = EditText(activity).apply {
-            hint = "https://generativelanguage.googleapis.com"
-            setText(geminiBaseUrl)
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
-            setSingleLine(true)
-        }
-
-        fun dialogActionBtn(title: String, onClick: () -> Unit): Button {
-            return Button(activity).apply {
-                text = title
-                isAllCaps = false
-                typeface = fontMedium
-                layoutParams = LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-                ).apply { topMargin = dp(8) }
-                setOnClickListener { onClick() }
-            }
-        }
-
-        container.addView(keyLabel)
-        container.addView(keyInput)
-        container.addView(proxyLabel)
-        container.addView(proxyInput)
-
-        lateinit var dialog: AlertDialog
-
-        container.addView(dialogActionBtn("Проверить голосовой вызов ИИ") {
-            geminiApiKey = keyInput.text.toString()
-            geminiBaseUrl = proxyInput.text.toString()
-            dialog.dismiss()
-            onTouchpadLongHold()
-        })
-
-        container.addView(dialogActionBtn("Тест камеры ИИ («Посмотри, что это»)") {
-            geminiApiKey = keyInput.text.toString()
-            geminiBaseUrl = proxyInput.text.toString()
-            dialog.dismiss()
-            handleRussianVoiceCommand("Посмотри и коротко скажи, что передо мной")
-        })
-
-        container.addView(dialogActionBtn("Назначить ассистента на дужку по умолчанию") {
-            runCatching {
-                activity.startActivity(Intent(Settings.ACTION_VOICE_INPUT_SETTINGS))
-            }.onFailure {
-                runCatching { activity.startActivity(Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS)) }
-            }
-        })
-
-        container.addView(dialogActionBtn("Мастер первичной настройки и разрешений") {
-            dialog.dismiss()
-            showFirstLaunchOnboardingDialog()
-        })
-
-        container.addView(dialogActionBtn("Открыть стоковый интерфейс CyanBridge") {
-            dialog.dismiss()
-            mainWrapperLayout?.visibility = View.GONE
-            floatingBackToMetaBtn?.visibility = View.VISIBLE
-        })
-
-        dialog = AlertDialog.Builder(activity)
-            .setTitle("Настройки OpenMeta")
-            .setView(container)
-            .setPositiveButton("Сохранить") { _, _ ->
-                geminiApiKey = keyInput.text.toString()
-                geminiBaseUrl = proxyInput.text.toString()
-                Toast.makeText(activity, "Настройки сохранены", Toast.LENGTH_SHORT).show()
-            }
-            .setNegativeButton("Закрыть", null)
-            .create()
-
-        dialog.show()
-    }
-
-    // ================= МАСТЕР ПЕРВОГО ЗАПУСКА =================
-
-    private fun showFirstLaunchOnboardingDialog() {
-        val box = LinearLayout(activity).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(22), dp(16), dp(22), dp(8))
-        }
-
-        val desc = TextView(activity).apply {
-            text = "1. Выберите профиль ваших очков.\n2. Выдайте разрешения для Bluetooth, микрофона и переноса медиа.\n3. Подключите очки."
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            setPadding(0, 0, 0, dp(12))
-        }
-        box.addView(desc)
-
-        val profileNames = arrayOf("TuneBuds / AI Glasses", "HeyCyan Glasses")
-        val savedProfileName = prefs.getString("selected_hw_profile_label", profileNames[0]) ?: profileNames[0]
-
-        val profileBtn = Button(activity).apply {
-            isAllCaps = false
-            text = "Профиль очков: $savedProfileName"
-            setOnClickListener {
-                AlertDialog.Builder(activity)
-                    .setTitle("Выберите профиль очков")
-                    .setItems(profileNames) { _, which ->
-                        val chosen = profileNames[which]
-                        prefs.edit().putString("selected_hw_profile_label", chosen).apply()
-                        text = "Профиль очков: $chosen"
-                    }
-                    .show()
-            }
-        }
-        box.addView(profileBtn)
-
-        val permBtn = Button(activity).apply {
-            isAllCaps = false
-            text = "Выдать все разрешения"
-            setOnClickListener { requestAllNecessaryPermissions() }
-        }
-        box.addView(permBtn)
-
-        val pairBtn = Button(activity).apply {
-            isAllCaps = false
-            text = "Найти и подключить очки"
-            setOnClickListener {
-                prefs.edit().putBoolean("onboarding_completed", true).apply()
-                releaseStuckCommandSlotIfIdle()
-                onScanClick()
-            }
-        }
-        box.addView(pairBtn)
+    private fun showSettingsDialog() {
+        val options = arrayOf(
+            "Привязать / сменить очки",
+            "Длительность записи видео",
+            "Настройки Bluetooth телефона",
+            "Открыть стоковый интерфейс CyanBridge"
+        )
 
         AlertDialog.Builder(activity)
-            .setTitle("Добро пожаловать в OpenMeta")
-            .setView(box)
-            .setPositiveButton("Готово") { _, _ ->
-                prefs.edit().putBoolean("onboarding_completed", true).apply()
-            }
-            .show()
-    }
-
-    private fun requestAllNecessaryPermissions() {
-        val perms = mutableListOf(
-            Manifest.permission.RECORD_AUDIO,
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION
-        )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            perms.add(Manifest.permission.BLUETOOTH_SCAN)
-            perms.add(Manifest.permission.BLUETOOTH_CONNECT)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            perms.add(Manifest.permission.NEARBY_WIFI_DEVICES)
-            perms.add(Manifest.permission.READ_MEDIA_VIDEO)
-            perms.add(Manifest.permission.READ_MEDIA_IMAGES)
-        }
-        activity.requestPermissions(perms.toTypedArray(), 777)
-    }
-
-    // ================= ИСПРАВЛЕННЫЙ ВЫЗОВ ИИ С ДУЖКИ =================
-
-    fun onTouchpadLongHold() {
-        val now = System.currentTimeMillis()
-        if (now - lastTriggerTimeMs < 1000L) return
-        lastTriggerTimeMs = now
-
-        mainHandler.post {
-            releaseStuckCommandSlotIfIdle()
-            if (activity.checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
-                PackageManager.PERMISSION_GRANTED
-            ) {
-                requestAllNecessaryPermissions()
-                speakRussian("Разрешите доступ к микрофону на экране телефона")
-                return@post
-            }
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
-                activity.setShowWhenLocked(true)
-                activity.setTurnScreenOn(true)
-            }
-            activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-
-            tts?.stop()
-            audioManager.mode = AudioManager.MODE_NORMAL
-
-            runCatching {
-                val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 85)
-                tone.startTone(ToneGenerator.TONE_PROP_BEEP, 120)
-                mainHandler.postDelayed({ tone.release() }, 160)
-            }
-
-            statusHintView?.text = "Слушаю... Произнесите вопрос или «Посмотри, что это»"
-            mainHandler.postDelayed({ startHandsFreeListening() }, 350)
-        }
-    }
-
-    private fun startHandsFreeListening() {
-        try {
-            speechRecognizer?.destroy()
-            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(activity.applicationContext).apply {
-                setRecognitionListener(object : RecognitionListener {
-                    override fun onReadyForSpeech(params: Bundle?) {
-                        statusHintView?.text = "Микрофон активен — говорите..."
-                    }
-
-                    override fun onBeginningOfSpeech() {
-                        statusHintView?.text = "Распознавание речи..."
-                    }
-
-                    override fun onResults(results: Bundle?) {
-                        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                        val query = matches?.firstOrNull()?.trim().orEmpty()
-                        if (query.isNotEmpty()) {
-                            statusHintView?.text = "Запрос: «$query»"
-                            handleRussianVoiceCommand(query)
-                        } else {
-                            statusHintView?.text = "Речь не распознана"
-                            speakRussian("Не расслышал, повторите")
-                        }
-                    }
-
-                    override fun onPartialResults(partialResults: Bundle?) {
-                        val partial = partialResults
-                            ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                            ?.firstOrNull()?.trim().orEmpty()
-                        if (partial.isNotEmpty()) {
-                            statusHintView?.text = "Слышу: «$partial»..."
-                        }
-                    }
-
-                    override fun onError(error: Int) {
-                        Log.w("OpenMetaAI", "SpeechRecognizer error=$error")
-                        statusHintView?.text = "Удержание дужки активирует голосовой ассистент"
-                        if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
-                            speakRussian("Не расслышал")
-                        }
-                    }
-
-                    override fun onRmsChanged(rmsdB: Float) {}
-                    override fun onBufferReceived(buffer: ByteArray?) {}
-                    override fun onEndOfSpeech() {}
-                    override fun onEvent(eventType: Int, params: Bundle?) {}
-                })
-            }
-
-            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
-                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 3000L)
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 3500L)
-                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 3000L)
-            }
-            speechRecognizer?.startListening(intent)
-        } catch (e: Exception) {
-            Log.e("OpenMetaAI", "SpeechRecognizer failed", e)
-            speakRussian("Сервис распознавания речи недоступен")
-        }
-    }
-
-    fun handleRussianVoiceCommand(query: String) {
-        val lower = query.lowercase(Locale("ru", "RU"))
-        val needsCamera = visionTriggers.any { lower.contains(it) }
-
-        if (geminiApiKey.isBlank()) {
-            speakRussian("Сначала укажите ключ нейросети в меню настроек")
-            showUnifiedSettingsDialog()
-            return
-        }
-
-        if (needsCamera) {
-            lastUserVisionQuery = query
-            speakRussian("Секунду, смотрю")
-            statusHintView?.text = "Получение кадра с очков..."
-
-            scope.launch(Dispatchers.IO) {
-                val tuneBuds = TuneBudsManager.getInstance(activity)
-                if (tuneBuds.isConnected()) {
-                    val photoBytes = runCatching { tuneBuds.capturePhotoForAi() }.getOrNull()
-                    if (photoBytes != null && photoBytes.isNotEmpty()) {
-                        val answer = askGeminiDirect(query, photoBytes)
-                        withContext(Dispatchers.Main) {
-                            statusHintView?.text = answer
-                            speakRussian(answer)
-                        }
-                    } else {
-                        withContext(Dispatchers.Main) {
-                            statusHintView?.text = "Не удалось получить снимок с очков"
-                            speakRussian("Не удалось получить кадр с очков, попробуйте снова")
-                        }
-                    }
-                } else {
-                    withContext(Dispatchers.Main) {
+            .setTitle("Настройки OpenMeta")
+            .setItems(options) { dialog, which ->
+                when (which) {
+                    0 -> {
+                        dialog.dismiss()
                         releaseStuckCommandSlotIfIdle()
-                        onVisionPhotoRequest()
+                        onScanClick()
+                    }
+                    1 -> {
+                        dialog.dismiss()
+                        showVideoDurationDialog()
+                    }
+                    2 -> {
+                        dialog.dismiss()
+                        runCatching { activity.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) }
+                    }
+                    3 -> {
+                        dialog.dismiss()
+                        mainWrapperLayout?.visibility = View.GONE
+                        floatingBackToMetaBtn?.visibility = View.VISIBLE
                     }
                 }
             }
-            return
-        }
-
-        statusHintView?.text = "Обработка запроса в Gemini..."
-        scope.launch(Dispatchers.IO) {
-            val reply = askGeminiDirect(query, null)
-            withContext(Dispatchers.Main) {
-                statusHintView?.text = reply
-                speakRussian(reply)
-            }
-        }
-    }
-
-    fun askGeminiDirect(prompt: String, imageBytes: ByteArray?): String {
-        val models = listOf("gemini-2.5-flash", "gemini-2.0-flash")
-        var lastError = "ошибка сети"
-
-        for (modelName in models) {
-            try {
-                val sysPrompt = "Ты голосовой ассистент в умных очках пользователя. " +
-                    "Отвечай на русском языке, коротко и по делу (1-3 предложения), " +
-                    "без списков и спецсимволов, так как ответ сразу озвучивается голосом."
-
-                val parts = JSONArray().apply {
-                    put(JSONObject().put("text", "$sysPrompt\n\nВопрос: $prompt"))
-                    if (imageBytes != null) {
-                        val b64 = Base64.encodeToString(imageBytes, Base64.NO_WRAP)
-                        val inlineData = JSONObject()
-                            .put("mime_type", "image/jpeg")
-                            .put("data", b64)
-                        put(JSONObject().put("inline_data", inlineData))
-                    }
-                }
-
-                val payload = JSONObject().put(
-                    "contents",
-                    JSONArray().put(JSONObject().put("parts", parts))
-                ).toString()
-
-                val endpoint = "$geminiBaseUrl/v1beta/models/$modelName:generateContent?key=$geminiApiKey"
-                val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
-                    requestMethod = "POST"
-                    connectTimeout = 15000
-                    readTimeout = 20000
-                    doOutput = true
-                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
-                }
-
-                conn.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
-                val code = conn.responseCode
-                if (code == HttpURLConnection.HTTP_OK) {
-                    val responseText = conn.inputStream.bufferedReader().use { it.readText() }
-                    conn.disconnect()
-                    return JSONObject(responseText)
-                        .getJSONArray("candidates")
-                        .getJSONObject(0)
-                        .getJSONObject("content")
-                        .getJSONArray("parts")
-                        .getJSONObject(0)
-                        .getString("text")
-                        .replace("*", "")
-                        .trim()
-                } else {
-                    val errBody = conn.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
-                    conn.disconnect()
-                    if (errBody.contains("User location is not supported", ignoreCase = true) ||
-                        errBody.contains("FAILED_PRECONDITION", ignoreCase = true)
-                    ) {
-                        return "Сервер Гугл отклонил прямой запрос без ВПН или прокси."
-                    }
-                    if (code == 400 && errBody.contains("API_KEY_INVALID", ignoreCase = true)) {
-                        return "Указан неверный ключ нейросети в настройках."
-                    }
-                    lastError = "код $code"
-                }
-            } catch (_: Exception) {
-                lastError = "нет связи с сервером"
-            }
-        }
-        return "Не удалось связаться с нейросетью, $lastError."
-    }
-
-    fun speakRussian(text: String) {
-        val useVoiceCallChannel = !isGlassesMediaAudioEnabled
-        if (useVoiceCallChannel) {
-            startGlassesVoiceCallChannel()
-        }
-        val params = Bundle().apply {
-            putInt(
-                TextToSpeech.Engine.KEY_PARAM_STREAM,
-                if (useVoiceCallChannel) AudioManager.STREAM_VOICE_CALL else AudioManager.STREAM_MUSIC
-            )
-        }
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, "OPENMETA_RU_${System.currentTimeMillis()}")
+            .setNegativeButton("Закрыть", null)
+            .show()
     }
 
     // ================= ПАЙПЛАЙН ОБРАБОТКИ ФОТО И ВИДЕО 2K =================
@@ -2303,7 +1754,7 @@ class BatteryVectorView(context: Context, private var tintColor: Int) : View(con
     private var online: Boolean = false
     private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 3f
+        strokeWidth = 2.4f
     }
     private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
@@ -2322,14 +1773,14 @@ class BatteryVectorView(context: Context, private var tintColor: Int) : View(con
         strokePaint.color = tintColor
         fillPaint.color = if (!online) Color.GRAY else if (level <= 15) Color.parseColor("#EF4444") else tintColor
 
-        val bodyRect = RectF(2f, 2f, w - 5f, h - 2f)
-        canvas.drawRoundRect(bodyRect, 4f, 4f, strokePaint)
-        canvas.drawRoundRect(RectF(w - 4f, h * 0.3f, w - 1f, h * 0.7f), 2f, 2f, fillPaint)
+        val bodyRect = RectF(1.5f, 1.5f, w - 4.5f, h - 1.5f)
+        canvas.drawRoundRect(bodyRect, 3f, 3f, strokePaint)
+        canvas.drawRoundRect(RectF(w - 3.5f, h * 0.3f, w - 1f, h * 0.7f), 1.5f, 1.5f, fillPaint)
 
         if (online) {
-            val fillWidth = (bodyRect.width() - 6f) * (level / 100f)
-            val innerRect = RectF(bodyRect.left + 3f, bodyRect.top + 3f, bodyRect.left + 3f + fillWidth, bodyRect.bottom - 3f)
-            canvas.drawRoundRect(innerRect, 2f, 2f, fillPaint)
+            val fillWidth = (bodyRect.width() - 5f) * (level / 100f)
+            val innerRect = RectF(bodyRect.left + 2.5f, bodyRect.top + 2.5f, bodyRect.left + 2.5f + fillWidth, bodyRect.bottom - 2.5f)
+            canvas.drawRoundRect(innerRect, 1.5f, 1.5f, fillPaint)
         }
     }
 }
@@ -2346,7 +1797,7 @@ class VectorIconView(context: Context, private val type: Int, private var color:
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE
-        strokeWidth = 4.2f
+        strokeWidth = 3.2f
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND
     }
@@ -2366,12 +1817,12 @@ class VectorIconView(context: Context, private val type: Int, private var color:
 
         when (type) {
             TYPE_PLUS -> {
-                canvas.drawLine(cx, h * 0.2f, cx, h * 0.8f, paint)
-                canvas.drawLine(w * 0.2f, cy, w * 0.8f, cy, paint)
+                canvas.drawLine(cx, h * 0.22f, cx, h * 0.78f, paint)
+                canvas.drawLine(w * 0.22f, cy, w * 0.78f, cy, paint)
             }
             TYPE_GEAR -> {
-                val rOuter = min(w, h) * 0.38f
-                val rInner = min(w, h) * 0.18f
+                val rOuter = min(w, h) * 0.36f
+                val rInner = min(w, h) * 0.17f
                 canvas.drawCircle(cx, cy, rInner, paint)
                 for (i in 0 until 8) {
                     val a = Math.toRadians((i * 45).toDouble())
@@ -2383,38 +1834,38 @@ class VectorIconView(context: Context, private val type: Int, private var color:
                 }
             }
             TYPE_MOON -> {
-                val r = min(w, h) * 0.34f
+                val r = min(w, h) * 0.32f
                 canvas.drawArc(RectF(cx - r, cy - r, cx + r, cy + r), 40f, 260f, false, paint)
             }
             TYPE_SUN -> {
-                val r = min(w, h) * 0.22f
+                val r = min(w, h) * 0.2f
                 canvas.drawCircle(cx, cy, r, paint)
                 for (i in 0 until 8) {
                     val a = Math.toRadians((i * 45).toDouble())
                     canvas.drawLine(
                         cx + r * 1.4f * cos(a).toFloat(),
                         cy + r * 1.4f * sin(a).toFloat(),
-                        cx + r * 1.9f * cos(a).toFloat(),
-                        cy + r * 1.9f * sin(a).toFloat(),
+                        cx + r * 1.85f * cos(a).toFloat(),
+                        cy + r * 1.85f * sin(a).toFloat(),
                         paint
                     )
                 }
             }
             TYPE_GLASSES -> {
-                val leftRect = RectF(w * 0.08f, h * 0.28f, w * 0.44f, h * 0.76f)
-                val rightRect = RectF(w * 0.56f, h * 0.28f, w * 0.92f, h * 0.76f)
-                canvas.drawRoundRect(leftRect, 6f, 6f, paint)
-                canvas.drawRoundRect(rightRect, 6f, 6f, paint)
-                canvas.drawLine(w * 0.44f, h * 0.42f, w * 0.56f, h * 0.42f, paint)
+                val leftRect = RectF(w * 0.08f, h * 0.3f, w * 0.44f, h * 0.74f)
+                val rightRect = RectF(w * 0.56f, h * 0.3f, w * 0.92f, h * 0.74f)
+                canvas.drawRoundRect(leftRect, 5f, 5f, paint)
+                canvas.drawRoundRect(rightRect, 5f, 5f, paint)
+                canvas.drawLine(w * 0.44f, h * 0.44f, w * 0.56f, h * 0.44f, paint)
             }
             TYPE_GRID -> {
-                val pad = w * 0.14f
+                val pad = w * 0.15f
                 val gap = w * 0.08f
                 val s = (w - pad * 2 - gap) / 2f
-                canvas.drawRoundRect(RectF(pad, pad, pad + s, pad + s), 4f, 4f, paint)
-                canvas.drawRoundRect(RectF(pad + s + gap, pad, w - pad, pad + s), 4f, 4f, paint)
-                canvas.drawRoundRect(RectF(pad, pad + s + gap, pad + s, h - pad), 4f, 4f, paint)
-                canvas.drawRoundRect(RectF(pad + s + gap, pad + s + gap, w - pad, h - pad), 4f, 4f, paint)
+                canvas.drawRoundRect(RectF(pad, pad, pad + s, pad + s), 3f, 3f, paint)
+                canvas.drawRoundRect(RectF(pad + s + gap, pad, w - pad, pad + s), 3f, 3f, paint)
+                canvas.drawRoundRect(RectF(pad, pad + s + gap, pad + s, h - pad), 3f, 3f, paint)
+                canvas.drawRoundRect(RectF(pad + s + gap, pad + s + gap, w - pad, h - pad), 3f, 3f, paint)
             }
         }
     }
@@ -2422,13 +1873,13 @@ class VectorIconView(context: Context, private val type: Int, private var color:
 
 class WayfarerGlassesView(context: Context, private val isDark: Boolean) : View(context) {
     private val framePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor(if (isDark) "#2A2E39" else "#1D1F23")
+        color = Color.parseColor(if (isDark) "#262A34" else "#1D1F23")
         style = Paint.Style.FILL
     }
     private val frameOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor(if (isDark) "#4B5563" else "#111315")
+        color = Color.parseColor(if (isDark) "#3E4656" else "#111315")
         style = Paint.Style.STROKE
-        strokeWidth = 3.5f
+        strokeWidth = 2.2f
     }
     private val lensPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.FILL
@@ -2436,14 +1887,14 @@ class WayfarerGlassesView(context: Context, private val isDark: Boolean) : View(
     private val cameraRingPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#9CA3AF")
         style = Paint.Style.STROKE
-        strokeWidth = 3f
+        strokeWidth = 2f
     }
     private val cameraCorePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.parseColor("#090A0C")
         style = Paint.Style.FILL
     }
     private val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(if (isDark) 60 else 28, 0, 0, 0)
+        color = Color.argb(if (isDark) 45 else 22, 0, 0, 0)
         style = Paint.Style.FILL
     }
 
@@ -2452,49 +1903,49 @@ class WayfarerGlassesView(context: Context, private val isDark: Boolean) : View(
         val w = width.toFloat()
         val h = height.toFloat()
         val cx = w * 0.5f
-        val cy = h * 0.48f
-        val scale = min(w / 340f, h / 120f)
+        val cy = h * 0.46f
+        val scale = min(w / 440f, h / 135f)
 
         canvas.drawOval(
-            RectF(cx - 115f * scale, cy + 44f * scale, cx + 115f * scale, cy + 54f * scale),
+            RectF(cx - 105f * scale, cy + 42f * scale, cx + 105f * scale, cy + 50f * scale),
             shadowPaint
         )
 
         lensPaint.shader = LinearGradient(
-            cx, cy - 35f * scale, cx, cy + 35f * scale,
-            Color.parseColor("#2B3330"),
-            Color.parseColor("#141817"),
+            cx, cy - 32f * scale, cx, cy + 32f * scale,
+            Color.parseColor("#252C2A"),
+            Color.parseColor("#121514"),
             Shader.TileMode.CLAMP
         )
 
         val framePath = Path().apply {
-            moveTo(cx - 135f * scale, cy - 26f * scale)
-            quadTo(cx - 72f * scale, cy - 34f * scale, cx - 16f * scale, cy - 22f * scale)
-            quadTo(cx, cy - 25f * scale, cx + 16f * scale, cy - 22f * scale)
-            quadTo(cx + 72f * scale, cy - 34f * scale, cx + 135f * scale, cy - 26f * scale)
-            lineTo(cx + 130f * scale, cy - 8f * scale)
-            quadTo(cx + 122f * scale, cy + 36f * scale, cx + 72f * scale, cy + 38f * scale)
-            quadTo(cx + 26f * scale, cy + 36f * scale, cx + 15f * scale, cy - 6f * scale)
-            quadTo(cx, cy - 12f * scale, cx - 15f * scale, cy - 6f * scale)
-            quadTo(cx - 26f * scale, cy + 36f * scale, cx - 72f * scale, cy + 38f * scale)
-            quadTo(cx - 122f * scale, cy + 36f * scale, cx - 130f * scale, cy - 8f * scale)
+            moveTo(cx - 130f * scale, cy - 24f * scale)
+            quadTo(cx - 70f * scale, cy - 31f * scale, cx - 15f * scale, cy - 20f * scale)
+            quadTo(cx, cy - 23f * scale, cx + 15f * scale, cy - 20f * scale)
+            quadTo(cx + 70f * scale, cy - 31f * scale, cx + 130f * scale, cy - 24f * scale)
+            lineTo(cx + 125f * scale, cy - 7f * scale)
+            quadTo(cx + 118f * scale, cy + 34f * scale, cx + 70f * scale, cy + 36f * scale)
+            quadTo(cx + 25f * scale, cy + 34f * scale, cx + 14f * scale, cy - 5f * scale)
+            quadTo(cx, cy - 11f * scale, cx - 14f * scale, cy - 5f * scale)
+            quadTo(cx - 25f * scale, cy + 34f * scale, cx - 70f * scale, cy + 36f * scale)
+            quadTo(cx - 118f * scale, cy + 34f * scale, cx - 125f * scale, cy - 7f * scale)
             close()
         }
         canvas.drawPath(framePath, framePaint)
         canvas.drawPath(framePath, frameOutlinePaint)
 
-        val leftLens = RectF(cx - 114f * scale, cy - 21f * scale, cx - 24f * scale, cy + 29f * scale)
-        val rightLens = RectF(cx + 24f * scale, cy - 21f * scale, cx + 114f * scale, cy + 29f * scale)
-        canvas.drawRoundRect(leftLens, 18f * scale, 22f * scale, lensPaint)
-        canvas.drawRoundRect(rightLens, 18f * scale, 22f * scale, lensPaint)
+        val leftLens = RectF(cx - 110f * scale, cy - 19f * scale, cx - 23f * scale, cy + 27f * scale)
+        val rightLens = RectF(cx + 23f * scale, cy - 19f * scale, cx + 110f * scale, cy + 27f * scale)
+        canvas.drawRoundRect(leftLens, 16f * scale, 20f * scale, lensPaint)
+        canvas.drawRoundRect(rightLens, 16f * scale, 20f * scale, lensPaint)
 
-        val camY = cy - 16f * scale
-        val leftCamX = cx - 122f * scale
-        val rightCamX = cx + 122f * scale
-        canvas.drawCircle(leftCamX, camY, 5.2f * scale, cameraCorePaint)
-        canvas.drawCircle(leftCamX, camY, 5.2f * scale, cameraRingPaint)
-        canvas.drawCircle(rightCamX, camY, 5.2f * scale, cameraCorePaint)
-        canvas.drawCircle(rightCamX, camY, 5.2f * scale, cameraRingPaint)
+        val camY = cy - 15f * scale
+        val leftCamX = cx - 117f * scale
+        val rightCamX = cx + 117f * scale
+        canvas.drawCircle(leftCamX, camY, 4.5f * scale, cameraCorePaint)
+        canvas.drawCircle(leftCamX, camY, 4.5f * scale, cameraRingPaint)
+        canvas.drawCircle(rightCamX, camY, 4.5f * scale, cameraCorePaint)
+        canvas.drawCircle(rightCamX, camY, 4.5f * scale, cameraRingPaint)
     }
 }
 
