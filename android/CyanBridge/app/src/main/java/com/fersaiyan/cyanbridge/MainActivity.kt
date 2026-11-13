@@ -10236,51 +10236,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         ) ?: return GallerySaveResult(false, null, 0L)
         return GallerySaveResult(true, Uri.fromFile(saved).toString(), saved.length())
     }
-            // Прогоняем скачанный MP4 через выбранный режим (Исходник / Meta 2K / Горизонт Lock 2K)
-            val finalVideoFile = kotlinx.coroutines.runBlocking {
-                openMetaManager.processVideoFile(rawTemp)
-            }
-            if (finalVideoFile != rawTemp) rawTemp.
-
-
-delete()
-
-            val resolver = contentResolver
-            val values = ContentValues().apply {
-                put(MediaStore.Video.Media.DISPLAY_NAME, displayName)
-                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                put(MediaStore.Video.Media.DATE_TAKEN, takenTimeMs)
-                put(MediaStore.Video.Media.DATE_ADDED, takenTimeMs / 1000)
-                put(MediaStore.Video.Media.DATE_MODIFIED, takenTimeMs / 1000)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    put(MediaStore.Video.Media.RELATIVE_PATH, SyncedMediaFolder.relativePath)
-                    put(MediaStore.Video.Media.IS_PENDING, 1)
-                }
-            }
-
-            val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
-                ?: return GallerySaveResult(false, null, 0).also { finalVideoFile.delete() }
-
-            var writtenBytes = 0L
-            resolver.openOutputStream(uri, "w")?.use { out ->
-                finalVideoFile.inputStream().use { procIn ->
-                    writtenBytes = procIn.copyTo(out)
-                }
-                out.flush()
-            }
-            finalVideoFile.delete()
-
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                val done = ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }
-                resolver.update(uri, done, null, null)
-            }
-            GallerySaveResult(true, uri.toString(), writtenBytes)
-        } catch (e: Exception) {
-            Log.e("DataDownload", "saveMp4ToGallery failed for $displayName: ${e.message}", e)
-            GallerySaveResult(false, null, 0)
-        }
-    }
-
+       
     private fun saveOpusToLibrary(
         payloadBytes: ByteArray,
         rawBytesSize: Int,
