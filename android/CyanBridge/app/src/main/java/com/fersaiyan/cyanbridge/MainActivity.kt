@@ -10203,27 +10203,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-  private fun saveJpegToGallery(
+ private fun saveJpegToGallery(
         input: InputStream,
         displayName: String,
         takenTimeMs: Long,
         contentLength: Long = -1L,
-    ): GallerySaveResult {
-        val saved = openMetaManager.saveIncomingFileFromGlasses(
-            input = input,
-            displayName = displayName,
-            takenTimeMs = takenTimeMs,
-            contentLength = contentLength,
-            onBytesCopied = null
-        ) ?: return GallerySaveResult(false, null, 0L)
-        return GallerySaveResult(true, Uri.fromFile(saved).toString(), saved.length())
-    }
-
-    private fun saveMp4ToGallery(
-        input: InputStream,
-        displayName: String,
-        takenTimeMs: Long,
-        contentLength: Long,
         onBytesCopied: ((Long, Long) -> Unit)? = null,
     ): GallerySaveResult {
         val saved = openMetaManager.saveIncomingFileFromGlasses(
@@ -10236,6 +10220,22 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         return GallerySaveResult(true, Uri.fromFile(saved).toString(), saved.length())
     }
 
+    private fun saveMp4ToGallery(
+        input: InputStream,
+        displayName: String,
+        takenTimeMs: Long,
+        contentLength: Long = -1L,
+        onBytesCopied: ((Long, Long) -> Unit)? = null,
+    ): GallerySaveResult {
+        val saved = openMetaManager.saveIncomingFileFromGlasses(
+            input = input,
+            displayName = displayName,
+            takenTimeMs = takenTimeMs,
+            contentLength = contentLength,
+            onBytesCopied = onBytesCopied
+        ) ?: return GallerySaveResult(false, null, 0L)
+        return GallerySaveResult(true, Uri.fromFile(saved).toString(), saved.length())
+    }
             // Прогоняем скачанный MP4 через выбранный режим (Исходник / Meta 2K / Горизонт Lock 2K)
             val finalVideoFile = kotlinx.coroutines.runBlocking {
                 openMetaManager.processVideoFile(rawTemp)
