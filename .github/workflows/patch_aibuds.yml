@@ -1,0 +1,152 @@
+name: Patch AI Buds APK
+
+on:
+  push:
+    paths:
+      - '.github/workflows/patch_aibuds.yml'
+  workflow_dispatch:
+
+jobs:
+  patch-aibuds:
+    runs-only: ubuntu-latest
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Download AIBuds_1.9.8.apk from Release Base
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download Base -p "AIBuds_1.9.8.apk" --repo ${{ github.repository }}
+          ls -lh AIBuds_1.9.8.apk
+
+      - name: Install Apktool and JADX
+        run: |
+          wget -q https://raw.githubusercontent.com/iBotPeaches/Apktool/master/scripts/linux/apktool -O /usr/local/bin/apktool
+          wget -q https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_2.10.0.jar -O /usr/local/bin/apktool.jar
+          chmod +x /usr/local/bin/apktool
+          wget -q https://github.com/skylot/jadx/releases/download/v1.5.0/jadx-1.5.0.zip -O jadx.zip
+          unzip -q jadx.zip -d jadx_bin
+          chmod +x jadx_bin/bin/jadx
+
+      - name: Decompile APK with Apktool & JADX
+        run: |
+          apktool d AIBuds_1.9.8.apk -o decoded
+          ./jadx_bin/bin/jadx -d jadx_src AIBuds_1.9.8.apk || true
+
+      - name: Analyze AI, Video Duration & Patch Ads/Strings
+        run: |
+          python3 - << 'EOF'
+          import os, re, glob, xml.etree.ElementTree as ET
+
+          print("=== 1. ПРОВЕРКА ЗАЩИТЫ И БИБЛИОТЕК ===")
+          for root, _, files in os.walk("decoded/lib"):
+              for f in files:
+                  print(os.path.join(root, f))
+
+          print("\n=== 2. ОТКЛЮЧЕНИЕ РЕКЛАМНЫХ МОДУЛЕЙ В MANIFEST ===")
+          manifest_path = "decoded/AndroidManifest.xml"
+          with open(manifest_path, "r", encoding="utf-8") as f:
+              manifest = f.read()
+
+          ad_keywords = [
+              "com.google.android.gms.ads",
+              "com.bytedance.sdk.openadsdk",
+              "com.mbridge.msdk",
+              "com.qq.e.ads",
+              "com.kwad.sdk",
+              "com.beizi",
+              "com.baidu.mobads",
+              "com.sigmob",
+              "com.tradplus",
+              "com.anythink"
+          ]
+
+          # Блокируем рекламные домены и ключи в smali
+          smali_patched = 0
+          for root, _, files in os.walk("decoded"):
+              for file in files:
+                  if file.endswith(".smali"):
+                      p = os.path.join(root, file)
+                      try:
+                          with open(p, "r", encoding="utf-8", errors="ignore") as sf:
+                              c = sf.read()
+                          orig = c
+                          for domain in ["pangolin-sdk-toutiao.com", "pglstatp-toutiao.com", "googleads.g.doubleclick.net", "rayjump.com", "gdt.qq.com"]:
+                              c = c.replace(domain, "127.0.0.1")
+                          if c != orig:
+                              with open(p, "w", encoding="utf-8") as sf:
+                                  sf.write(c)
+                              smali_patched += 1
+                      except Exception:
+                          pass
+          print(f"Обезврежено рекламных smali-файлов: {smali_patched}")
+
+          print("\n=== 3. РУССКИЕ СТРОКИ (res/values-ru/strings.xml) ===")
+          ru_files = glob.glob("decoded/res/values*ru*/strings.xml")
+          for rf in ru_files:
+              print(f"Найден файл перевода: {rf}")
+              with open(rf, "r", encoding="utf-8") as f:
+                  lines = f.readlines()
+              print("Первые 120 строк перевода:")
+              for line in lines[:120]:
+                  print(line.rstrip())
+
+          print("\n=== 4. ПОИСК КОМАНД ДЛИНЫ ВИДЕО И ИИ В ИСХОДНИКАХ ===")
+          os.makedirs("extracted_info", exist_ok=True)
+          if ru_files:
+              os.system("cp decoded/res/values*ru*/strings.xml extracted_info/ 2>/dev/null || true")
+          os.system("cp decoded/AndroidManifest.xml extracted_info/ 2>/dev/null || true")
+
+          matches_log = []
+          for root, _, files in os.walk("jadx_src/sources"):
+              for file in files:
+                  if file.endswith(".java"):
+                      p = os.path.join(root, file)
+                      low_p = p.lower()
+                      if any(k in low_p for k in ["com/android", "androidx/", "com/google", "kotlin/", "okhttp3/", "retrofit2/"]):
+                          continue
+                      try:
+                          with open(p, "r", encoding="utf-8", errors="ignore") as jf:
+                              code = jf.read()
+                          if any(w in code for w in ["videoDuration", "recordTime", "setVideo", "LargeDataHandler", "openai", "deepseek", "chat/completions", "speech", "180", "360", "720"]):
+                              rel = os.path.relpath(p, "jadx_src/sources")
+                              matches_log.append(f"\n--- FILE: {rel} ---\n" + code[:3500])
+                      except Exception:
+                          pass
+
+          with open("extracted_info/found_classes.txt", "w", encoding="utf-8") as out:
+              out.write("\n".join(matches_log))
+
+          print(f"Найдено ключевых классов приложения: {len(matches_log)}")
+          for m in matches_log[:12]:
+              print(m[:1200])
+          EOF
+
+      - name: Rebuild and Sign Patched AI Buds APK
+        run: |
+          apktool b decoded -o aibuds_unsigned.apk --use-aapt2
+          keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          BUILD_TOOLS=$(ls -d $ANDROID_HOME/build-tools/* | tail -n 1)
+          $BUILD_TOOLS/zipalign -p -f 4 aibuds_unsigned.apk aibuds_aligned.apk
+          $BUILD_TOOLS/apksigner sign --ks debug.keystore --ks-pass pass:android --key-pass pass:android --out AIBuds_Mod_NoAds.apk aibuds_aligned.apk
+
+      - name: Upload Patched APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AIBuds-Patched-APK
+          path: AIBuds_Mod_NoAds.apk
+
+      - name: Upload Extracted Code & Strings
+        uses: actions/upload-artifact@v4
+        with:
+          name: AIBuds-Extracted-Info
+          path: extracted_info/
