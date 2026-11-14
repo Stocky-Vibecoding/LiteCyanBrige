@@ -1,5 +1,6 @@
 package com.fersaiyan.cyanbridge
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.AlertDialog
@@ -11,6 +12,7 @@ import android.bluetooth.BluetoothProfile
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -25,24 +27,41 @@ import android.graphics.RectF
 import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.media.MediaMetadataRetriever
 import android.media.ThumbnailUtils
+import android.media.ToneGenerator
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import android.net.Uri
 import android.opengl.GLES20
 import android.os.Build
+import android.os.Bundle
 import android.os.CountDownTimer
 import android.os.Environment
 import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
 import android.provider.Settings
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
+import android.text.InputType
 import android.text.TextUtils
+import android.util.Base64
 import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
+import android.view.WindowManager
+import android.widget.Button
+import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
@@ -79,9 +98,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -126,9 +149,15 @@ class OpenMetaManager(
     private val prefs = activity.getSharedPreferences("openmeta_ru_prefs", Context.MODE_PRIVATE)
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private val mainHandler = Handler(Looper.getMainLooper())
+    private val audioManager = activity.getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
     private val fontMedium = Typeface.create("sans-serif-medium", Typeface.NORMAL)
     private val fontBold = Typeface.create("sans-serif", Typeface.BOLD)
+
+    private var tts: TextToSpeech? = null
+    private var speechRecognizer: SpeechRecognizer? = null
+    private var mediaSession: MediaSession? = null
+    private var lastTriggerTimeMs = 0L
 
     private var rootMountContainer: FrameLayout? = null
     private var mainWrapperLayout: LinearLayout? = null
@@ -144,6 +173,7 @@ class OpenMetaManager(
 
     private var batteryTextView: TextView? = null
     private var batteryIconView: BatteryVectorView? = null
+    private var statusHintView: TextView? = null
     private var homeRecentGridContainer: LinearLayout? = null
 
     private var recordingCardLayout: LinearLayout? = null
@@ -166,11 +196,14 @@ class OpenMetaManager(
     private var lastKnownConnected = false
     private var lastKnownBattery: Int? = null
 
-    // Заглушки для совместимости со старыми вызовами в MainActivity.kt
-    var lastUserVisionQuery: String = ""
-    fun onTouchpadLongHold() {}
-    fun askGeminiDirect(prompt: String, imageBytes: ByteArray?): String = ""
-    fun speakRussian(text: String) {}
+    var lastUserVisionQuery: String = "Коротко опиши, что перед пользователем на этом кадре."
+
+    private val visionTriggers = listOf(
+        "посмотри", "смотри", "глянь", "взгляни", "видишь",
+        "что это", "сто это", "че это", "чё это", "что тут",
+        "что здесь", "что за", "что перед", "кто это",
+        "прочитай", "переведи", "оцени", "сфоткай", "сфотай", "на фото", "покажи"
+    )
 
     var isDarkMode: Boolean
         get() = prefs.getBoolean("meta_dark_mode", true)
@@ -194,6 +227,21 @@ class OpenMetaManager(
             applyGlassesA2dpRoute(value)
         }
 
+    var geminiApiKey: String
+        get() = prefs.getString("gemini_api_key", "") ?: ""
+        set(value) {
+            prefs.edit().putString("gemini_api_key", value.trim()).apply()
+        }
+
+    var geminiBaseUrl: String
+        get() = prefs.getString("gemini_base_url", "https://generativelanguage.googleapis.com")
+            ?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }
+            ?: "https://generativelanguage.googleapis.com"
+        set(value) {
+            val clean = value.trim().trimEnd('/').ifEmpty { "https://generativelanguage.googleapis.com" }
+            prefs.edit().putString("gemini_base_url", clean).apply()
+        }
+
     var currentRenderMode: OpenMetaRenderMode
         get() = OpenMetaRenderMode.fromId(prefs.getInt("render_mode", OpenMetaRenderMode.META_FAST_2K.id))
         set(value) {
@@ -204,8 +252,59 @@ class OpenMetaManager(
         get() = File(activity.filesDir, "openmeta_synced").apply { if (!exists()) mkdirs() }
 
     init {
+        tts = TextToSpeech(activity.applicationContext) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                tts?.language = Locale("ru", "RU")
+                tts?.setSpeechRate(1.05f)
+                tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                    override fun onStart(utteranceId: String?) {}
+                    override fun onDone(utteranceId: String?) {
+                        if (!isGlassesMediaAudioEnabled) stopGlassesVoiceCallChannel()
+                    }
+                    override fun onError(utteranceId: String?) {
+                        if (!isGlassesMediaAudioEnabled) stopGlassesVoiceCallChannel()
+                    }
+                })
+            }
+        }
+        setupMediaSessionInterceptor()
         if (!isGlassesMediaAudioEnabled) {
             mainHandler.postDelayed({ applyGlassesA2dpRoute(false) }, 1200)
+        }
+    }
+
+    private fun setupMediaSessionInterceptor() {
+        runCatching {
+            mediaSession = MediaSession(activity, "OpenMetaSession").apply {
+                setPlaybackState(
+                    PlaybackState.Builder()
+                        .setActions(
+                            PlaybackState.ACTION_PLAY or
+                                PlaybackState.ACTION_PAUSE or
+                                PlaybackState.ACTION_PLAY_PAUSE
+                        )
+                        .setState(PlaybackState.STATE_PAUSED, 0L, 1f)
+                        .build()
+                )
+                setCallback(object : MediaSession.Callback() {
+                    override fun onMediaButtonEvent(mediaButtonIntent: Intent): Boolean {
+                        val event = mediaButtonIntent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
+                        if (event != null && event.action == KeyEvent.ACTION_DOWN) {
+                            when (event.keyCode) {
+                                KeyEvent.KEYCODE_VOICE_ASSIST,
+                                KeyEvent.KEYCODE_ASSIST,
+                                KeyEvent.KEYCODE_HEADSETHOOK,
+                                KeyEvent.KEYCODE_CALL -> {
+                                    onTouchpadLongHold()
+                                    return true
+                                }
+                            }
+                        }
+                        return super.onMediaButtonEvent(mediaButtonIntent)
+                    }
+                })
+                isActive = true
+            }
         }
     }
 
@@ -323,6 +422,39 @@ class OpenMetaManager(
             val m = adapter.javaClass.getMethod("removeActiveDevice", Int::class.javaPrimitiveType)
             m.isAccessible = true
             m.invoke(adapter, 0)
+        }
+    }
+
+    private fun startGlassesVoiceCallChannel() {
+        runCatching {
+            audioManager.mode = AudioManager.MODE_IN_COMMUNICATION
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val btVoiceDevice = audioManager.availableCommunicationDevices.firstOrNull {
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                        it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+                }
+                if (btVoiceDevice != null) {
+                    audioManager.setCommunicationDevice(btVoiceDevice)
+                    return
+                }
+            }
+            @Suppress("DEPRECATION")
+            audioManager.startBluetoothSco()
+            @Suppress("DEPRECATION")
+            audioManager.isBluetoothScoOn = true
+        }
+    }
+
+    private fun stopGlassesVoiceCallChannel() {
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                audioManager.clearCommunicationDevice()
+            }
+            @Suppress("DEPRECATION")
+            audioManager.isBluetoothScoOn = false
+            @Suppress("DEPRECATION")
+            audioManager.stopBluetoothSco()
+            audioManager.mode = AudioManager.MODE_NORMAL
         }
     }
 
@@ -555,7 +687,7 @@ class OpenMetaManager(
             setPadding(dp(16), dp(4), dp(16), dp(20))
         }
 
-        // КАРТОЧКА ОЧКОВ (без клика на картинку очков и без надписи про ИИ)
+        // КАРТОЧКА ОЧКОВ (без клика на картинку очков)
         val heroCard = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(14), dp(16), dp(14))
@@ -621,18 +753,18 @@ class OpenMetaManager(
                     layoutParams = FrameLayout.LayoutParams(dp(18), dp(18), Gravity.CENTER)
                 }
             )
-            setOnClickListener { showSettingsDialog() }
+            setOnClickListener { showUnifiedSettingsDialog() }
         }
 
         heroTopRow.addView(heroLeftCol)
         heroTopRow.addView(gearBtn)
         heroCard.addView(heroTopRow)
 
-        // Компактная иллюстрация очков по центру (без обработчика нажатия)
+        // Аккуратная иллюстрация очков по центру (без обработчика клика)
         val glassesDrawing = WayfarerGlassesView(activity, dark).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(82)
+                dp(80)
             ).apply {
                 topMargin = dp(4)
                 bottomMargin = dp(2)
@@ -692,9 +824,19 @@ class OpenMetaManager(
         recordingCardLayout?.addView(recHeaderRow)
         recordingCardLayout?.addView(recordingProgressBar)
         heroCard.addView(recordingCardLayout)
+
+        statusHintView = TextView(activity).apply {
+            text = "Голосовой ИИ: удержание дужки или нажатие сюда"
+            gravity = Gravity.CENTER
+            setTextColor(Color.parseColor(textSecondary))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setPadding(0, dp(4), 0, 0)
+            setOnClickListener { onTouchpadLongHold() }
+        }
+        heroCard.addView(statusHintView)
         content.addView(heroCard)
 
-        // СЕТКА КНОПОК 2x2 ВО ВСЮ ШИРИНУ ЭКРАНА (без прокрутки и без бутафорских точек)
+        // СЕТКА КНОПОК 2x2 ПО ШИРИНЕ ЭКРАНА (без обрезанного скролла и без нерабочих точек)
         fun createGridActionBtn(): TextView {
             return TextView(activity).apply {
                 gravity = Gravity.CENTER
@@ -719,9 +861,9 @@ class OpenMetaManager(
             setOnClickListener {
                 isGlassesMediaAudioEnabled = !isGlassesMediaAudioEnabled
                 val msg = if (isGlassesMediaAudioEnabled) {
-                    "Звук медиа: через очки"
+                    "Аудио медиа направлено через очки"
                 } else {
-                    "Режим Авто: музыка идет на авто/телефон"
+                    "Режим Авто: музыка идет на внешнее устройство, ИИ и звонки — в очках"
                 }
                 Toast.makeText(activity, msg, Toast.LENGTH_SHORT).show()
             }
@@ -921,7 +1063,7 @@ class OpenMetaManager(
         content.addView(transferBannerCard)
 
         val gridSectionTitle = TextView(activity).apply {
-            text = "Файлы с очков"
+            text = "Перенесенные файлы"
             setTextColor(Color.parseColor(textPrimary))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             typeface = fontBold
@@ -1001,7 +1143,7 @@ class OpenMetaManager(
                 transferProgressBar?.visibility = View.GONE
                 transferStatusTitle?.text = "Перенос завершен"
                 val mb = String.format(Locale.US, "%.1f МБ", copiedBytes / (1024f * 1024f))
-                transferStatusSubtitle?.text = "Загружен $cleanName ($mb). Нажмите на превью ниже для просмотра и обработки."
+                transferStatusSubtitle?.text = "Загружен $cleanName ($mb). Нажмите на превью ниже для просмотра и 2K-обработки."
                 refreshAllMediaGrids()
             }
             targetFile
@@ -1575,42 +1717,335 @@ class OpenMetaManager(
         }
     }
 
-    // ================= МЕНЮ НАСТРОЕК (ШЕСТЕРЕНКА) =================
+    // ================= МЕНЮ НАСТРОЕК (ШЕСТЕРЕНКА: GEMINI ИИ + ТЕСТЫ + СТОК) =================
 
-    private fun showSettingsDialog() {
-        val options = arrayOf(
-            "Привязать / сменить очки",
-            "Длительность записи видео",
-            "Настройки Bluetooth телефона",
-            "Открыть стоковый интерфейс CyanBridge"
-        )
+    private fun showUnifiedSettingsDialog() {
+        val container = LinearLayout(activity).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(14), dp(20), dp(8))
+        }
 
-        AlertDialog.Builder(activity)
+        val keyLabel = TextView(activity).apply {
+            text = "API-ключ Google Gemini"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            typeface = fontMedium
+        }
+        val keyInput = EditText(activity).apply {
+            hint = "AIzaSy..."
+            setText(geminiApiKey)
+            inputType = InputType.TYPE_CLASS_TEXT
+            setSingleLine(true)
+        }
+
+        val proxyLabel = TextView(activity).apply {
+            text = "Адрес сервера API (или прокси для работы без VPN)"
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            typeface = fontMedium
+            setPadding(0, dp(10), 0, 0)
+        }
+        val proxyInput = EditText(activity).apply {
+            hint = "https://generativelanguage.googleapis.com"
+            setText(geminiBaseUrl)
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            setSingleLine(true)
+        }
+
+        fun dialogActionBtn(title: String, onClick: () -> Unit): Button {
+            return Button(activity).apply {
+                text = title
+                isAllCaps = false
+                typeface = fontMedium
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+                ).apply { topMargin = dp(6) }
+                setOnClickListener { onClick() }
+            }
+        }
+
+        container.addView(keyLabel)
+        container.addView(keyInput)
+        container.addView(proxyLabel)
+        container.addView(proxyInput)
+
+        lateinit var dialog: AlertDialog
+
+        container.addView(dialogActionBtn("Проверить голосовой вызов ИИ") {
+            geminiApiKey = keyInput.text.toString()
+            geminiBaseUrl = proxyInput.text.toString()
+            dialog.dismiss()
+            onTouchpadLongHold()
+        })
+
+        container.addView(dialogActionBtn("Тест камеры ИИ («Посмотри, что это»)") {
+            geminiApiKey = keyInput.text.toString()
+            geminiBaseUrl = proxyInput.text.toString()
+            dialog.dismiss()
+            handleRussianVoiceCommand("Посмотри и коротко скажи, что передо мной")
+        })
+
+        container.addView(dialogActionBtn("Назначить ассистента на дужку по умолчанию") {
+            runCatching {
+                activity.startActivity(Intent(Settings.ACTION_VOICE_INPUT_SETTINGS))
+            }.onFailure {
+                runCatching { activity.startActivity(Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS)) }
+            }
+        })
+
+        container.addView(dialogActionBtn("Открыть стоковый интерфейс CyanBridge") {
+            dialog.dismiss()
+            mainWrapperLayout?.visibility = View.GONE
+            floatingBackToMetaBtn?.visibility = View.VISIBLE
+        })
+
+        dialog = AlertDialog.Builder(activity)
             .setTitle("Настройки OpenMeta")
-            .setItems(options) { dialog, which ->
-                when (which) {
-                    0 -> {
-                        dialog.dismiss()
+            .setView(container)
+            .setPositiveButton("Сохранить") { _, _ ->
+                geminiApiKey = keyInput.text.toString()
+                geminiBaseUrl = proxyInput.text.toString()
+                Toast.makeText(activity, "Настройки сохранены", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Закрыть", null)
+            .create()
+
+        dialog.show()
+    }
+
+    // ================= ВЫЗОВ ГОЛОСОВОГО ИИ И КАМЕРЫ =================
+
+    fun onTouchpadLongHold() {
+        val now = System.currentTimeMillis()
+        if (now - lastTriggerTimeMs < 1000L) return
+        lastTriggerTimeMs = now
+
+        mainHandler.post {
+            releaseStuckCommandSlotIfIdle()
+            if (activity.checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+                PackageManager.PERMISSION_GRANTED
+            ) {
+                activity.requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 701)
+                speakRussian("Разрешите доступ к микрофону на экране телефона")
+                return@post
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                activity.setShowWhenLocked(true)
+                activity.setTurnScreenOn(true)
+            }
+            activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
+            tts?.stop()
+            audioManager.mode = AudioManager.MODE_NORMAL
+
+            runCatching {
+                val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 85)
+                tone.startTone(ToneGenerator.TONE_PROP_BEEP, 120)
+                mainHandler.postDelayed({ tone.release() }, 160)
+            }
+
+            statusHintView?.text = "Слушаю... Произнесите вопрос или «Посмотри, что это»"
+            mainHandler.postDelayed({ startHandsFreeListening() }, 350)
+        }
+    }
+
+    private fun startHandsFreeListening() {
+        try {
+            speechRecognizer?.destroy()
+            speechRecognizer = SpeechRecognizer.createSpeechRecognizer(activity.applicationContext).apply {
+                setRecognitionListener(object : RecognitionListener {
+                    override fun onReadyForSpeech(params: Bundle?) {
+                        statusHintView?.text = "Микрофон активен — говорите..."
+                    }
+
+                    override fun onBeginningOfSpeech() {
+                        statusHintView?.text = "Распознавание речи..."
+                    }
+
+                    override fun onResults(results: Bundle?) {
+                        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                        val query = matches?.firstOrNull()?.trim().orEmpty()
+                        if (query.isNotEmpty()) {
+                            statusHintView?.text = "Запрос: «$query»"
+                            handleRussianVoiceCommand(query)
+                        } else {
+                            statusHintView?.text = "Речь не распознана"
+                            speakRussian("Не расслышал, повторите")
+                        }
+                    }
+
+                    override fun onPartialResults(partialResults: Bundle?) {
+                        val partial = partialResults
+                            ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                            ?.firstOrNull()?.trim().orEmpty()
+                        if (partial.isNotEmpty()) {
+                            statusHintView?.text = "Слышу: «$partial»..."
+                        }
+                    }
+
+                    override fun onError(error: Int) {
+                        Log.w("OpenMetaAI", "SpeechRecognizer error=$error")
+                        statusHintView?.text = "Голосовой ИИ: удержание дужки или нажатие сюда"
+                        if (error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
+                            speakRussian("Не расслышал")
+                        }
+                    }
+
+                    override fun onRmsChanged(rmsdB: Float) {}
+                    override fun onBufferReceived(buffer: ByteArray?) {}
+                    override fun onEndOfSpeech() {}
+                    override fun onEvent(eventType: Int, params: Bundle?) {}
+                })
+            }
+
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ru-RU")
+                putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 3000L)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 3500L)
+                putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 3000L)
+            }
+            speechRecognizer?.startListening(intent)
+        } catch (e: Exception) {
+            Log.e("OpenMetaAI", "SpeechRecognizer failed", e)
+            speakRussian("Сервис распознавания речи недоступен")
+        }
+    }
+
+    fun handleRussianVoiceCommand(query: String) {
+        val lower = query.lowercase(Locale("ru", "RU"))
+        val needsCamera = visionTriggers.any { lower.contains(it) }
+
+        if (geminiApiKey.isBlank()) {
+            speakRussian("Сначала укажите ключ нейросети в меню настроек")
+            showUnifiedSettingsDialog()
+            return
+        }
+
+        if (needsCamera) {
+            lastUserVisionQuery = query
+            speakRussian("Секунду, смотрю")
+            statusHintView?.text = "Получение кадра с очков..."
+
+            scope.launch(Dispatchers.IO) {
+                val tuneBuds = TuneBudsManager.getInstance(activity)
+                if (tuneBuds.isConnected()) {
+                    val photoBytes = runCatching { tuneBuds.capturePhotoForAi() }.getOrNull()
+                    if (photoBytes != null && photoBytes.isNotEmpty()) {
+                        val answer = askGeminiDirect(query, photoBytes)
+                        withContext(Dispatchers.Main) {
+                            statusHintView?.text = answer
+                            speakRussian(answer)
+                        }
+                    } else {
+                        withContext(Dispatchers.Main) {
+                            statusHintView?.text = "Не удалось получить снимок с очков"
+                            speakRussian("Не удалось получить кадр с очков, попробуйте снова")
+                        }
+                    }
+                } else {
+                    withContext(Dispatchers.Main) {
                         releaseStuckCommandSlotIfIdle()
-                        onScanClick()
-                    }
-                    1 -> {
-                        dialog.dismiss()
-                        showVideoDurationDialog()
-                    }
-                    2 -> {
-                        dialog.dismiss()
-                        runCatching { activity.startActivity(Intent(Settings.ACTION_BLUETOOTH_SETTINGS)) }
-                    }
-                    3 -> {
-                        dialog.dismiss()
-                        mainWrapperLayout?.visibility = View.GONE
-                        floatingBackToMetaBtn?.visibility = View.VISIBLE
+                        onVisionPhotoRequest()
                     }
                 }
             }
-            .setNegativeButton("Закрыть", null)
-            .show()
+            return
+        }
+
+        statusHintView?.text = "Обработка запроса в Gemini..."
+        scope.launch(Dispatchers.IO) {
+            val reply = askGeminiDirect(query, null)
+            withContext(Dispatchers.Main) {
+                statusHintView?.text = reply
+                speakRussian(reply)
+            }
+        }
+    }
+
+    fun askGeminiDirect(prompt: String, imageBytes: ByteArray?): String {
+        val models = listOf("gemini-2.5-flash", "gemini-2.0-flash")
+        var lastError = "ошибка сети"
+
+        for (modelName in models) {
+            try {
+                val sysPrompt = "Ты голосовой ассистент в умных очках пользователя. " +
+                    "Отвечай на русском языке, коротко и по делу (1-3 предложения), " +
+                    "без списков и спецсимволов, так как ответ сразу озвучивается голосом."
+
+                val parts = JSONArray().apply {
+                    put(JSONObject().put("text", "$sysPrompt\n\nВопрос: $prompt"))
+                    if (imageBytes != null) {
+                        val b64 = Base64.encodeToString(imageBytes, Base64.NO_WRAP)
+                        val inlineData = JSONObject()
+                            .put("mime_type", "image/jpeg")
+                            .put("data", b64)
+                        put(JSONObject().put("inline_data", inlineData))
+                    }
+                }
+
+                val payload = JSONObject().put(
+                    "contents",
+                    JSONArray().put(JSONObject().put("parts", parts))
+                ).toString()
+
+                val endpoint = "$geminiBaseUrl/v1beta/models/$modelName:generateContent?key=$geminiApiKey"
+                val conn = (URL(endpoint).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    connectTimeout = 15000
+                    readTimeout = 20000
+                    doOutput = true
+                    setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                }
+
+                conn.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
+                val code = conn.responseCode
+                if (code == HttpURLConnection.HTTP_OK) {
+                    val responseText = conn.inputStream.bufferedReader().use { it.readText() }
+                    conn.disconnect()
+                    return JSONObject(responseText)
+                        .getJSONArray("candidates")
+                        .getJSONObject(0)
+                        .getJSONObject("content")
+                        .getJSONArray("parts")
+                        .getJSONObject(0)
+                        .getString("text")
+                        .replace("*", "")
+                        .trim()
+                } else {
+                    val errBody = conn.errorStream?.bufferedReader()?.use { it.readText() }.orEmpty()
+                    conn.disconnect()
+                    if (errBody.contains("User location is not supported", ignoreCase = true) ||
+                        errBody.contains("FAILED_PRECONDITION", ignoreCase = true)
+                    ) {
+                        return "Сервер Гугл отклонил прямой запрос без ВПН или прокси."
+                    }
+                    if (code == 400 && errBody.contains("API_KEY_INVALID", ignoreCase = true)) {
+                        return "Указан неверный ключ нейросети в настройках."
+                    }
+                    lastError = "код $code"
+                }
+            } catch (_: Exception) {
+                lastError = "нет связи с сервером"
+            }
+        }
+        return "Не удалось связаться с нейросетью, $lastError."
+    }
+
+    fun speakRussian(text: String) {
+        val useVoiceCallChannel = !isGlassesMediaAudioEnabled
+        if (useVoiceCallChannel) {
+            startGlassesVoiceCallChannel()
+        }
+        val params = Bundle().apply {
+            putInt(
+                TextToSpeech.Engine.KEY_PARAM_STREAM,
+                if (useVoiceCallChannel) AudioManager.STREAM_VOICE_CALL else AudioManager.STREAM_MUSIC
+            )
+        }
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, "OPENMETA_RU_${System.currentTimeMillis()}")
     }
 
     // ================= ПАЙПЛАЙН ОБРАБОТКИ ФОТО И ВИДЕО 2K =================
