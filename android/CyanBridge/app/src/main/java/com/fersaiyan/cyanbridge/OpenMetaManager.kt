@@ -59,6 +59,7 @@ import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.Window
+import android.view.WindowInsets
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
@@ -163,6 +164,7 @@ class OpenMetaManager(
     private var mainWrapperLayout: LinearLayout? = null
     private var floatingBackToMetaBtn: TextView? = null
     private var activeTabIndex: Int = 0
+    private var lastMeasuredWidthPx: Int = 0
 
     private var homeTabContainer: ScrollView? = null
     private var mediaTabContainer: ScrollView? = null
@@ -314,6 +316,13 @@ class OpenMetaManager(
         }
     }
 
+    // Максимальная ширина контента для удобного отображения на внутреннем и внешнем экранах Fold
+    private fun maxContentWidthPx(): Int {
+        val screenW = (rootMountContainer?.width?.takeIf { it > 0 }
+            ?: activity.resources.displayMetrics.widthPixels)
+        return min(screenW, dp(520))
+    }
+
     // ================= АВТОМОБИЛЬНЫЙ РЕЖИМ (УПРАВЛЕНИЕ ПРОФИЛЕМ A2DP) =================
 
     @SuppressLint("MissingPermission")
@@ -458,7 +467,7 @@ class OpenMetaManager(
         }
     }
 
-    // ================= ПОСТРОЕНИЕ ИНТЕРФЕЙСА OPENMETA =================
+    // ================= ПОСТРОЕНИЕ ИНТЕРФЕЙСА С АДАПТАЦИЕЙ ПОД FOLD =================
 
     fun attachRussianMetaUi() {
         val mount = FrameLayout(activity).apply {
@@ -466,6 +475,13 @@ class OpenMetaManager(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
+            addOnLayoutChangeListener { _, left, _, right, _, _, _, _, _ ->
+                val newW = right - left
+                if (newW > 0 && abs(newW - lastMeasuredWidthPx) > dp(40)) {
+                    lastMeasuredWidthPx = newW
+                    mainHandler.post { rebuildMetaUi() }
+                }
+            }
         }
         rootMountContainer = mount
         activity.addContentView(
@@ -490,9 +506,11 @@ class OpenMetaManager(
         val textSecondary = if (dark) "#9CA3AF" else "#6B7280"
         val strokeSubtle = if (dark) "#262B38" else "#E5E7EB"
         val metaBlue = "#0064E0"
+        val colWidth = maxContentWidthPx()
 
         val mainWrapper = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
             layoutParams = FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
@@ -501,11 +519,24 @@ class OpenMetaManager(
         }
         mainWrapperLayout = mainWrapper
 
-        // ВЕРХНЯЯ ШАПКА
-        val topBar = LinearLayout(activity).apply {
+        // ВЕРХНЯЯ ШАПКА (центрируется по ширине контента на разложенном Fold)
+        val topBarOuter = FrameLayout(activity).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            setPadding(0, dp(34), 0, dp(8))
+        }
+
+        val topBarInner = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(16), dp(28), dp(16), dp(10))
+            layoutParams = FrameLayout.LayoutParams(
+                colWidth,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER_HORIZONTAL
+            )
+            setPadding(dp(16), 0, dp(16), 0)
         }
 
         val headerTitle = TextView(activity).apply {
@@ -545,28 +576,42 @@ class OpenMetaManager(
             setOnClickListener { isDarkMode = !dark }
         }
 
-        topBar.addView(headerTitle)
-        topBar.addView(btnAddDevice)
-        topBar.addView(btnThemeToggle)
-        mainWrapper.addView(topBar)
+        topBarInner.addView(headerTitle)
+        topBarInner.addView(btnAddDevice)
+        topBarInner.addView(btnThemeToggle)
+        topBarOuter.addView(topBarInner)
+        mainWrapper.addView(topBarOuter)
 
+        // КОНТЕЙНЕР ВКЛАДОК
         val pagesFrame = FrameLayout(activity).apply {
             layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         }
 
-        homeTabContainer = buildHomeTab(dark, bgCard, bgBtn, textPrimary, textSecondary, strokeSubtle, metaBlue)
-        mediaTabContainer = buildMediaTab(dark, bgCard, textPrimary, textSecondary, strokeSubtle, metaBlue)
+        homeTabContainer = buildHomeTab(dark, bgCard, bgBtn, textPrimary, textSecondary, strokeSubtle, metaBlue, colWidth)
+        mediaTabContainer = buildMediaTab(dark, bgCard, textPrimary, textSecondary, strokeSubtle, metaBlue, colWidth)
 
         pagesFrame.addView(homeTabContainer)
         pagesFrame.addView(mediaTabContainer)
         mainWrapper.addView(pagesFrame)
 
-        // НИЖНЯЯ ПАНЕЛЬ НА 2 ВКЛАДКИ (Устройства | Медиа)
-        val bottomNav = LinearLayout(activity).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
+        // НИЖНЯЯ ПАНЕЛЬ НА 2 ВКЛАДКИ (Устройства | Медиа) — жестко отцентрирована для любого экрана Fold
+        val bottomNavOuter = FrameLayout(activity).apply {
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
             background = roundedBg(bgCard, 0f, strokeSubtle)
-            setPadding(dp(12), dp(6), dp(12), dp(10))
+            setPadding(0, dp(8), 0, dp(22))
+        }
+
+        val bottomNavInner = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            layoutParams = FrameLayout.LayoutParams(
+                colWidth,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER_HORIZONTAL
+            )
         }
 
         val tabHomeBox = LinearLayout(activity).apply {
@@ -577,13 +622,22 @@ class OpenMetaManager(
             setOnClickListener { switchTab(0) }
         }
         bottomTabHomeIcon = VectorIconView(activity, VectorIconView.TYPE_GLASSES, Color.parseColor(metaBlue)).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(22), dp(18))
+            layoutParams = LinearLayout.LayoutParams(dp(24), dp(18)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+            }
         }
         bottomTabHomeLabel = TextView(activity).apply {
             text = "Устройства"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            gravity = Gravity.CENTER
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             typeface = fontMedium
-            setPadding(0, dp(2), 0, 0)
+            setPadding(0, dp(3), 0, 0)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+            }
         }
         tabHomeBox.addView(bottomTabHomeIcon)
         tabHomeBox.addView(bottomTabHomeLabel)
@@ -596,20 +650,49 @@ class OpenMetaManager(
             setOnClickListener { switchTab(1) }
         }
         bottomTabMediaIcon = VectorIconView(activity, VectorIconView.TYPE_GRID, Color.parseColor(textSecondary)).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(18), dp(18))
+            layoutParams = LinearLayout.LayoutParams(dp(18), dp(18)).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+            }
         }
         bottomTabMediaLabel = TextView(activity).apply {
             text = "Медиа"
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            gravity = Gravity.CENTER
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             typeface = fontMedium
-            setPadding(0, dp(2), 0, 0)
+            setPadding(0, dp(3), 0, 0)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                gravity = Gravity.CENTER_HORIZONTAL
+            }
         }
         tabMediaBox.addView(bottomTabMediaIcon)
         tabMediaBox.addView(bottomTabMediaLabel)
 
-        bottomNav.addView(tabHomeBox)
-        bottomNav.addView(tabMediaBox)
-        mainWrapper.addView(bottomNav)
+        bottomNavInner.addView(tabHomeBox)
+        bottomNavInner.addView(tabMediaBox)
+        bottomNavOuter.addView(bottomNavInner)
+        mainWrapper.addView(bottomNavOuter)
+
+        // Автоматический учет системных отступов статус-бара и нижней панели задач Fold
+        mainWrapper.setOnApplyWindowInsetsListener { _, insets ->
+            val topInset = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                insets.getInsets(WindowInsets.Type.statusBars()).top
+            } else {
+                @Suppress("DEPRECATION")
+                insets.systemWindowInsetTop
+            }
+            val bottomInset = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                insets.getInsets(WindowInsets.Type.navigationBars()).bottom
+            } else {
+                @Suppress("DEPRECATION")
+                insets.systemWindowInsetBottom
+            }
+            topBarOuter.setPadding(0, topInset.coerceAtLeast(dp(24)) + dp(8), 0, dp(8))
+            bottomNavOuter.setPadding(0, dp(8), 0, bottomInset.coerceAtLeast(dp(14)) + dp(6))
+            insets
+        }
 
         val backBtn = TextView(activity).apply {
             text = "Вернуться в OpenMeta"
@@ -624,7 +707,7 @@ class OpenMetaManager(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.BOTTOM or Gravity.END
             ).apply {
-                bottomMargin = dp(82)
+                bottomMargin = dp(86)
                 rightMargin = dp(16)
             }
             setOnClickListener {
@@ -671,7 +754,8 @@ class OpenMetaManager(
         textPrimary: String,
         textSecondary: String,
         strokeSubtle: String,
-        metaBlue: String
+        metaBlue: String,
+        colWidth: Int
     ): ScrollView {
         val scroll = ScrollView(activity).apply {
             layoutParams = FrameLayout.LayoutParams(
@@ -682,12 +766,23 @@ class OpenMetaManager(
             isVerticalScrollBarEnabled = false
         }
 
+        val outerHolder = FrameLayout(activity).apply {
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
         val content = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
+            layoutParams = FrameLayout.LayoutParams(
+                colWidth,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER_HORIZONTAL
+            )
             setPadding(dp(16), dp(4), dp(16), dp(20))
         }
 
-        // КАРТОЧКА ОЧКОВ (без клика на картинку очков)
         val heroCard = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(14), dp(16), dp(14))
@@ -760,7 +855,6 @@ class OpenMetaManager(
         heroTopRow.addView(gearBtn)
         heroCard.addView(heroTopRow)
 
-        // Аккуратная иллюстрация очков по центру (без обработчика клика)
         val glassesDrawing = WayfarerGlassesView(activity, dark).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -774,7 +868,6 @@ class OpenMetaManager(
         }
         heroCard.addView(glassesDrawing)
 
-        // Плашка активной записи видео с таймером и кнопкой «Остановить»
         recordingCardLayout = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             visibility = if (isRecordingVideo) View.VISIBLE else View.GONE
@@ -836,7 +929,7 @@ class OpenMetaManager(
         heroCard.addView(statusHintView)
         content.addView(heroCard)
 
-        // СЕТКА КНОПОК 2x2 ПО ШИРИНЕ ЭКРАНА (без обрезанного скролла и без нерабочих точек)
+        // СЕТКА КНОПОК 2x2
         fun createGridActionBtn(): TextView {
             return TextView(activity).apply {
                 gravity = Gravity.CENTER
@@ -963,7 +1056,8 @@ class OpenMetaManager(
         homeRecentGridContainer = recentCard
         content.addView(recentCard)
 
-        scroll.addView(content)
+        outerHolder.addView(content)
+        scroll.addView(outerHolder)
         return scroll
     }
 
@@ -975,7 +1069,8 @@ class OpenMetaManager(
         textPrimary: String,
         textSecondary: String,
         strokeSubtle: String,
-        metaBlue: String
+        metaBlue: String,
+        colWidth: Int
     ): ScrollView {
         val scroll = ScrollView(activity).apply {
             layoutParams = FrameLayout.LayoutParams(
@@ -986,8 +1081,20 @@ class OpenMetaManager(
             isVerticalScrollBarEnabled = false
         }
 
+        val outerHolder = FrameLayout(activity).apply {
+            layoutParams = ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
         val content = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
+            layoutParams = FrameLayout.LayoutParams(
+                colWidth,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER_HORIZONTAL
+            )
             setPadding(dp(16), dp(4), dp(16), dp(20))
         }
 
@@ -1083,7 +1190,8 @@ class OpenMetaManager(
         mediaFullGridContainer = fullGridCard
         content.addView(fullGridCard)
 
-        scroll.addView(content)
+        outerHolder.addView(content)
+        scroll.addView(outerHolder)
         return scroll
     }
 
@@ -1227,8 +1335,8 @@ class OpenMetaManager(
             return
         }
 
-        val screenWidth = activity.resources.displayMetrics.widthPixels
-        val cellSide = ((screenWidth - dp(56)) / 4).coerceAtLeast(dp(64))
+        val effectiveWidth = maxContentWidthPx()
+        val cellSide = ((effectiveWidth - dp(56)) / 4).coerceIn(dp(64), dp(115))
         val rowCount = (items.size + 3) / 4
 
         for (r in 0 until rowCount) {
@@ -1481,10 +1589,8 @@ class OpenMetaManager(
 
         dialog.setContentView(root)
         dialog.window?.setBackgroundDrawableResource(android.R.color.transparent)
-        dialog.window?.setLayout(
-            (activity.resources.displayMetrics.widthPixels * 0.92f).toInt(),
-            ViewGroup.LayoutParams.WRAP_CONTENT
-        )
+        val dialogWidth = min((activity.resources.displayMetrics.widthPixels * 0.92f).toInt(), dp(440))
+        dialog.window?.setLayout(dialogWidth, ViewGroup.LayoutParams.WRAP_CONTENT)
         dialog.setOnDismissListener { runCatching { videoViewRef?.stopPlayback() } }
         dialog.show()
     }
