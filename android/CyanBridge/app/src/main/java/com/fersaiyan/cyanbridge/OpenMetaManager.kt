@@ -109,6 +109,7 @@ import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -190,6 +191,15 @@ class OpenMetaManager(
     private var transferStatusSubtitle: TextView? = null
     private var transferProgressBar: ProgressBar? = null
     private var mediaFullGridContainer: LinearLayout? = null
+
+    // Элементы множественного выбора файлов по удержанию
+    private var isSelectionMode = false
+    private val selectedFilePaths = LinkedHashSet<String>()
+    private val activeCellUpdaters = mutableListOf<() -> Unit>()
+    private val thumbnailCache = ConcurrentHashMap<String, Bitmap>()
+    private var selectionBarOuter: FrameLayout? = null
+    private var selectionCountTextView: TextView? = null
+    private var selectionDeleteBtnView: TextView? = null
 
     private var activeVideoTimer: CountDownTimer? = null
     private var isRecordingVideo = false
@@ -316,7 +326,6 @@ class OpenMetaManager(
         }
     }
 
-    // Максимальная ширина контента для удобного отображения на внутреннем и внешнем экранах Fold
     private fun maxContentWidthPx(): Int {
         val screenW = (rootMountContainer?.width?.takeIf { it > 0 }
             ?: activity.resources.displayMetrics.widthPixels)
@@ -519,7 +528,7 @@ class OpenMetaManager(
         }
         mainWrapperLayout = mainWrapper
 
-        // ВЕРХНЯЯ ШАПКА (центрируется по ширине контента на разложенном Fold)
+        // ВЕРХНЯЯ ШАПКА
         val topBarOuter = FrameLayout(activity).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -594,7 +603,79 @@ class OpenMetaManager(
         pagesFrame.addView(mediaTabContainer)
         mainWrapper.addView(pagesFrame)
 
-        // НИЖНЯЯ ПАНЕЛЬ НА 2 ВКЛАДКИ (Устройства | Медиа) — жестко отцентрирована для любого экрана Fold
+        // ПАНЕЛЬ МНОЖЕСТВЕННОГО ВЫБОРА И УДАЛЕНИЯ (появляется при удержании файла)
+        selectionBarOuter = FrameLayout(activity).apply {
+            visibility = if (isSelectionMode) View.VISIBLE else View.GONE
+            background = roundedBg(bgCard, 0f, strokeSubtle)
+            setPadding(0, dp(10), 0, dp(10))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+        }
+
+        val selectionBarInner = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = FrameLayout.LayoutParams(
+                colWidth,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER_HORIZONTAL
+            )
+            setPadding(dp(16), 0, dp(16), 0)
+        }
+
+        val cancelSelectBtn = TextView(activity).apply {
+            text = "Отмена"
+            setTextColor(Color.parseColor(textSecondary))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            typeface = fontMedium
+            background = roundedBg(bgBtn, 10f, strokeSubtle)
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            setOnClickListener { exitSelectionMode() }
+        }
+
+        selectionCountTextView = TextView(activity).apply {
+            text = "Выбрано: ${selectedFilePaths.size}"
+            gravity = Gravity.CENTER
+            setTextColor(Color.parseColor(textPrimary))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            typeface = fontBold
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+
+        val selectAllBtn = TextView(activity).apply {
+            text = "Все"
+            setTextColor(Color.parseColor(textPrimary))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            typeface = fontMedium
+            background = roundedBg(bgBtn, 10f, strokeSubtle)
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { rightMargin = dp(8) }
+            setOnClickListener { selectAllStagedFiles() }
+        }
+
+        selectionDeleteBtnView = TextView(activity).apply {
+            text = "Удалить (${selectedFilePaths.size})"
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            typeface = fontMedium
+            background = roundedBg("#EF4444", 10f)
+            setPadding(dp(14), dp(8), dp(14), dp(8))
+            setOnClickListener { confirmAndDeleteSelectedFiles() }
+        }
+
+        selectionBarInner.addView(cancelSelectBtn)
+        selectionBarInner.addView(selectionCountTextView)
+        selectionBarInner.addView(selectAllBtn)
+        selectionBarInner.addView(selectionDeleteBtnView)
+        selectionBarOuter?.addView(selectionBarInner)
+        mainWrapper.addView(selectionBarOuter)
+
+        // НИЖНЯЯ ПАНЕЛЬ НА 2 ВКЛАДКИ (Устройства | Медиа)
         val bottomNavOuter = FrameLayout(activity).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -675,7 +756,6 @@ class OpenMetaManager(
         bottomNavOuter.addView(bottomNavInner)
         mainWrapper.addView(bottomNavOuter)
 
-        // Автоматический учет системных отступов статус-бара и нижней панели задач Fold
         mainWrapper.setOnApplyWindowInsetsListener { _, insets ->
             val topInset = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 insets.getInsets(WindowInsets.Type.statusBars()).top
@@ -1126,7 +1206,7 @@ class OpenMetaManager(
         }
 
         transferStatusSubtitle = TextView(activity).apply {
-            text = "Нажмите «Перенести», чтобы загрузить фото и видео с очков"
+            text = "Нажмите «Перенести» для загрузки. Удерживайте фото или видео для выбора и удаления."
             setTextColor(Color.parseColor(textSecondary))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
             setPadding(0, dp(2), dp(8), 0)
@@ -1169,14 +1249,33 @@ class OpenMetaManager(
         transferBannerCard?.addView(transferProgressBar)
         content.addView(transferBannerCard)
 
+        val gridHeaderRow = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(8) }
+        }
+
         val gridSectionTitle = TextView(activity).apply {
             text = "Перенесенные файлы"
             setTextColor(Color.parseColor(textPrimary))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             typeface = fontBold
-            setPadding(0, 0, 0, dp(8))
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
-        content.addView(gridSectionTitle)
+
+        val gridHintLabel = TextView(activity).apply {
+            text = "Удержание — выбор"
+            setTextColor(Color.parseColor(textSecondary))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            typeface = fontMedium
+        }
+
+        gridHeaderRow.addView(gridSectionTitle)
+        gridHeaderRow.addView(gridHintLabel)
+        content.addView(gridHeaderRow)
 
         val fullGridCard = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
@@ -1251,7 +1350,7 @@ class OpenMetaManager(
                 transferProgressBar?.visibility = View.GONE
                 transferStatusTitle?.text = "Перенос завершен"
                 val mb = String.format(Locale.US, "%.1f МБ", copiedBytes / (1024f * 1024f))
-                transferStatusSubtitle?.text = "Загружен $cleanName ($mb). Нажмите на превью ниже для просмотра и 2K-обработки."
+                transferStatusSubtitle?.text = "Загружен $cleanName ($mb). Нажмите для 2K-обработки или удерживайте для выбора."
                 refreshAllMediaGrids()
             }
             targetFile
@@ -1280,13 +1379,78 @@ class OpenMetaManager(
         }
     }
 
-    // ================= СЕТКА ПРЕВЬЮ И ОКНО ПРОСМОТРА С ВЫБОРОМ ОБРАБОТКИ =================
+    // ================= СЕТКА ПРЕВЬЮ, МНОЖЕСТВЕННЫЙ ВЫБОР ПО УДЕРЖАНИЮ И ПРОСМОТР =================
 
     private data class StagedMediaFile(
         val file: File,
         val isVideo: Boolean,
         val durationMs: Long
     )
+
+    private fun toggleItemSelection(filePath: String) {
+        if (selectedFilePaths.contains(filePath)) {
+            selectedFilePaths.remove(filePath)
+            if (selectedFilePaths.isEmpty()) {
+                isSelectionMode = false
+            }
+        } else {
+            selectedFilePaths.add(filePath)
+        }
+        syncSelectionUiState()
+    }
+
+    private fun exitSelectionMode() {
+        isSelectionMode = false
+        selectedFilePaths.clear()
+        syncSelectionUiState()
+    }
+
+    private fun selectAllStagedFiles() {
+        val allPaths = stagingDir.listFiles()
+            ?.filter { it.isFile && (it.name.endsWith(".mp4", true) || it.name.endsWith(".jpg", true)) }
+            ?.map { it.absolutePath }
+            .orEmpty()
+        if (allPaths.isNotEmpty()) {
+            isSelectionMode = true
+            selectedFilePaths.addAll(allPaths)
+            syncSelectionUiState()
+        }
+    }
+
+    private fun confirmAndDeleteSelectedFiles() {
+        val count = selectedFilePaths.size
+        if (count == 0) return
+
+        AlertDialog.Builder(activity)
+            .setTitle("Удаление файлов")
+            .setMessage("Удалить выбранные файлы ($count шт.) из памяти приложения?")
+            .setPositiveButton("Удалить") { _, _ ->
+                var deletedCount = 0
+                selectedFilePaths.toList().forEach { path ->
+                    thumbnailCache.remove(path)
+                    val f = File(path)
+                    if (f.exists() && f.delete()) {
+                        deletedCount++
+                    }
+                }
+                exitSelectionMode()
+                refreshAllMediaGrids()
+                Toast.makeText(activity, "Удалено файлов: $deletedCount", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("Отмена", null)
+            .show()
+    }
+
+    private fun syncSelectionUiState() {
+        val count = selectedFilePaths.size
+        selectionBarOuter?.visibility = if (isSelectionMode) View.VISIBLE else View.GONE
+        selectionCountTextView?.text = "Выбрано: $count"
+        selectionDeleteBtnView?.text = "Удалить ($count)"
+        selectionDeleteBtnView?.alpha = if (count > 0) 1f else 0.45f
+        selectionDeleteBtnView?.isEnabled = count > 0
+
+        activeCellUpdaters.forEach { it.invoke() }
+    }
 
     fun refreshAllMediaGrids() {
         val homeContainer = homeRecentGridContainer
@@ -1301,16 +1465,29 @@ class OpenMetaManager(
                 ?.sortedByDescending { it.lastModified() }
                 .orEmpty()
 
+            val existingPaths = allFiles.map { it.absolutePath }.toSet()
+            selectedFilePaths.retainAll(existingPaths)
+            if (selectedFilePaths.isEmpty()) {
+                isSelectionMode = false
+            }
+
             val stagedItems = allFiles.take(40).map { f ->
                 val isVid = f.name.endsWith(".mp4", true)
                 val dur = if (isVid) extractVideoDurationMs(f) else 0L
                 StagedMediaFile(f, isVid, dur)
             }
-            val thumbs = stagedItems.map { item -> createLocalThumbnail(item.file, item.isVideo) }
+            val thumbs = stagedItems.map { item ->
+                val path = item.file.absolutePath
+                thumbnailCache[path] ?: createLocalThumbnail(item.file, item.isVideo)?.also {
+                    thumbnailCache[path] = it
+                }
+            }
 
             withContext(Dispatchers.Main) {
+                activeCellUpdaters.clear()
                 homeContainer?.let { populateGridContainer(it, stagedItems.take(8), thumbs.take(8), cellBg, textSec) }
                 mediaContainer?.let { populateGridContainer(it, stagedItems, thumbs, cellBg, textSec) }
+                syncSelectionUiState()
             }
         }
     }
@@ -1363,6 +1540,7 @@ class OpenMetaManager(
                 if (idx < items.size) {
                     val item = items[idx]
                     val bmp = thumbs[idx]
+                    val filePath = item.file.absolutePath
 
                     val img = ImageView(activity).apply {
                         layoutParams = FrameLayout.LayoutParams(
@@ -1395,7 +1573,63 @@ class OpenMetaManager(
                         cellFrame.addView(durBadge)
                     }
 
-                    cellFrame.setOnClickListener { showMediaPreviewAndProcessDialog(item) }
+                    // Полупрозрачная синяя рамка-заливка при выборе файла
+                    val selectionOverlay = View(activity).apply {
+                        layoutParams = FrameLayout.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.MATCH_PARENT
+                        )
+                        background = GradientDrawable().apply {
+                            shape = GradientDrawable.RECTANGLE
+                            cornerRadius = dp(8).toFloat()
+                            setColor(Color.parseColor("#4D0064E0"))
+                            setStroke(dp(2), Color.parseColor("#0064E0"))
+                        }
+                        visibility = View.GONE
+                    }
+                    cellFrame.addView(selectionOverlay)
+
+                    // Векторный чекбокс выбора в правом верхнем углу превью
+                    val checkBadge = SelectionBadgeView(activity).apply {
+                        layoutParams = FrameLayout.LayoutParams(
+                            dp(20),
+                            dp(20),
+                            Gravity.TOP or Gravity.END
+                        ).apply {
+                            topMargin = dp(5)
+                            rightMargin = dp(5)
+                        }
+                        visibility = View.GONE
+                    }
+                    cellFrame.addView(checkBadge)
+
+                    val cellUpdater: () -> Unit = {
+                        val checked = selectedFilePaths.contains(filePath)
+                        checkBadge.visibility = if (isSelectionMode) View.VISIBLE else View.GONE
+                        checkBadge.setCheckedState(checked)
+                        selectionOverlay.visibility = if (isSelectionMode && checked) View.VISIBLE else View.GONE
+                    }
+                    activeCellUpdaters.add(cellUpdater)
+                    cellUpdater.invoke()
+
+                    cellFrame.setOnClickListener {
+                        if (isSelectionMode) {
+                            toggleItemSelection(filePath)
+                        } else {
+                            showMediaPreviewAndProcessDialog(item)
+                        }
+                    }
+
+                    cellFrame.setOnLongClickListener {
+                        if (!isSelectionMode) {
+                            isSelectionMode = true
+                            selectedFilePaths.add(filePath)
+                            syncSelectionUiState()
+                        } else {
+                            toggleItemSelection(filePath)
+                        }
+                        true
+                    }
                 }
                 rowLayout.addView(cellFrame)
             }
@@ -1568,6 +1802,7 @@ class OpenMetaManager(
 
         val deleteBtn = actionButton("Удалить", isPrimary = false, isDanger = true) {
             runCatching { videoViewRef?.stopPlayback() }
+            thumbnailCache.remove(item.file.absolutePath)
             item.file.delete()
             dialog.dismiss()
             refreshAllMediaGrids()
@@ -2288,6 +2523,53 @@ class OpenMetaManager(
                 setStroke(dp(1), Color.parseColor(strokeColor))
             }
         }
+}
+
+// Векторный индикатор выбора файла на превью (кружок с галочкой)
+class SelectionBadgeView(context: Context) : View(context) {
+    private var checked = false
+    private val bgFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val ringPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        color = Color.WHITE
+    }
+    private val checkPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3.2f
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+        color = Color.WHITE
+    }
+
+    fun setCheckedState(isChecked: Boolean) {
+        if (checked != isChecked) {
+            checked = isChecked
+            invalidate()
+        }
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val cx = width * 0.5f
+        val cy = height * 0.5f
+        val r = min(width, height) * 0.44f
+
+        bgFillPaint.color = if (checked) Color.parseColor("#0064E0") else Color.parseColor("#66000000")
+        canvas.drawCircle(cx, cy, r, bgFillPaint)
+        canvas.drawCircle(cx, cy, r, ringPaint)
+
+        if (checked) {
+            val path = Path().apply {
+                moveTo(cx - r * 0.42f, cy + r * 0.02f)
+                lineTo(cx - r * 0.1f, cy + r * 0.34f)
+                lineTo(cx + r * 0.46f, cy - r * 0.28f)
+            }
+            canvas.drawPath(path, checkPaint)
+        }
+    }
 }
 
 class BatteryVectorView(context: Context, private var tintColor: Int) : View(context) {
