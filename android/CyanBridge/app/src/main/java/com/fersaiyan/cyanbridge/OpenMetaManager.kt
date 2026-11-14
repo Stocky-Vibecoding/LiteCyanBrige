@@ -118,20 +118,20 @@ import kotlin.math.min
 import kotlin.math.sin
 
 enum class OpenMetaRenderMode(val id: Int, val title: String, val subtitle: String) {
-    RAW_ORIGINAL(
-        0,
-        "Оригинал 1600×1200",
-        "Без обработки, прямое сохранение в Галерею"
-    ),
     META_FAST_2K(
         1,
-        "Meta 2K (Стабилизация + Резкость)",
+        "Обработать в Meta 2K (Стабилизация + Резкость)",
         "Апскейл 2048×1536, шейдер резкости CAS и коррекция цвета"
     ),
     HORIZON_LOCK_2K(
         2,
         "Горизонт Lock 2K (Удержание горизонта)",
         "Выравнивание наклона головы, полная стабилизация и апскейл 2K"
+    ),
+    RAW_ORIGINAL(
+        0,
+        "Оригинал 1600×1200 (Без обработки)",
+        "Прямое сохранение исходного файла в Галерею"
     );
 
     companion object {
@@ -186,13 +186,19 @@ class OpenMetaManager(
     private var btnVideoLimit: TextView? = null
     private var btnCarAudio: TextView? = null
 
+    // Плашка «Ход синхронизации» (как в стоке)
     private var transferBannerCard: LinearLayout? = null
     private var transferStatusTitle: TextView? = null
+    private var transferScenarioBadge: TextView? = null
+    private var transferCountersText: TextView? = null
     private var transferStatusSubtitle: TextView? = null
     private var transferProgressBar: ProgressBar? = null
+    private var transferStartBtn: TextView? = null
+    private var transferCancelBtn: TextView? = null
     private var mediaFullGridContainer: LinearLayout? = null
+    private var isByteStreamActive = false
 
-    // Элементы множественного выбора файлов по удержанию
+    // Множественный выбор по удержанию
     private var isSelectionMode = false
     private val selectedFilePaths = LinkedHashSet<String>()
     private val activeCellUpdaters = mutableListOf<() -> Unit>()
@@ -204,6 +210,7 @@ class OpenMetaManager(
     private var activeVideoTimer: CountDownTimer? = null
     private var isRecordingVideo = false
     private var isRenderingVideo = false
+    private var elapsedSegmentSec = 0
 
     private var lastKnownConnected = false
     private var lastKnownBattery: Int? = null
@@ -229,6 +236,7 @@ class OpenMetaManager(
         set(value) {
             prefs.edit().putInt("video_duration_sec", value).apply()
             updateDurationButtonUi()
+            pushVideoDurationToGlasses(value)
         }
 
     var isGlassesMediaAudioEnabled: Boolean
@@ -263,6 +271,14 @@ class OpenMetaManager(
     private val stagingDir: File
         get() = File(activity.filesDir, "openmeta_synced").apply { if (!exists()) mkdirs() }
 
+    // Фоновый синхронизатор статуса со стоковой карточкой «Ход синхронизации»
+    private val syncMonitorRunnable = object : Runnable {
+        override fun run() {
+            pollStockSyncUiState()
+            mainHandler.postDelayed(this, 250L)
+        }
+    }
+
     init {
         tts = TextToSpeech(activity.applicationContext) { status ->
             if (status == TextToSpeech.SUCCESS) {
@@ -283,6 +299,8 @@ class OpenMetaManager(
         if (!isGlassesMediaAudioEnabled) {
             mainHandler.postDelayed({ applyGlassesA2dpRoute(false) }, 1200)
         }
+        mainHandler.postDelayed({ pushVideoDurationToGlasses(selectedVideoDurationSec) }, 1500)
+        mainHandler.postDelayed(syncMonitorRunnable, 500L)
     }
 
     private fun setupMediaSessionInterceptor() {
@@ -330,6 +348,229 @@ class OpenMetaManager(
         val screenW = (rootMountContainer?.width?.takeIf { it > 0 }
             ?: activity.resources.displayMetrics.widthPixels)
         return min(screenW, dp(520))
+    }
+
+    // ================= ЖИВОЕ ЧТЕНИЕ СТАТУСА «ХОД СИНХРОНИЗАЦИИ» ИЗ СТОКА =================
+
+    private fun isStockDownloadActive(): Boolean {
+        return runCatching {
+            val f = activity.javaClass.getDeclaredField("downloadInProgress").apply { isAccessible = true }
+            f.getBoolean(activity)
+        }.getOrDefault(false)
+    }
+
+    private fun pollStockSyncUiState() {
+        if (isByteStreamActive) return
+        runCatching {
+            val decor = activity.window?.decorView as? ViewGroup ?: return
+            val stockTexts = mutableListOf<String>()
+            var stockProgress: ProgressBar? = null
+
+            fun scanView(v: View) {
+                if (v === rootMountContainer) return
+                if (v is TextView && v !is Button && v !is EditText) {
+                    val t = v.text?.toString()?.trim().orEmpty()
+                    if (t.isNotEmpty()) stockTexts.add(t)
+                } else if (v is ProgressBar && v.visibility == View.VISIBLE) {
+                    stockProgress = v
+                }
+                if (v is ViewGroup) {
+                    for (i in 0 until v.childCount) {
+                        scanView(v.getChildAt(i))
+                    }
+                }
+            }
+            scanView(decor)
+
+            val scenarioLine = stockTexts.firstOrNull {
+                it.startsWith("Сценарий:", true) || it.startsWith("Scenario:", true)
+            }
+            val countersLine = stockTexts.firstOrNull {
+                (it.contains("Photos:", true) && it.contains("Videos:", true)) ||
+                    (it.contains("Фото:", true) && it.contains("Видео:", true))
+            }
+            val detailLine = stockTexts.firstOrNull {
+                it.startsWith("Downloading", true) ||
+                    it.startsWith("Скачивание", true) ||
+                    it.startsWith("Подключение", true) ||
+                    it.startsWith("Connecting", true) ||
+                    it.contains(".mp4", true) ||
+                    it.contains(".jpg", true)
+            }
+
+            val active = isStockDownloadActive() || detailLine != null || (stockProgress != null && countersLine != null)
+
+            if (scenarioLine != null) {
+                transferScenarioBadge?.text = scenarioLine
+                transferScenarioBadge?.visibility = View.VISIBLE
+            }
+            if (countersLine != null) {
+                transferCountersText?.text = countersLine
+                transferCountersText?.visibility = View.VISIBLE
+            }
+
+            if (active) {
+                transferProgressBar?.visibility = View.VISIBLE
+                transferCancelBtn?.visibility = View.VISIBLE
+                val sp = stockProgress
+                if (sp != null && !sp.isIndeterminate && sp.max > 0) {
+                    transferProgressBar?.isIndeterminate = false
+                    transferProgressBar?.max = sp.max
+                    transferProgressBar?.progress = sp.progress
+                } else {
+                    transferProgressBar?.isIndeterminate = true
+                }
+                if (!detailLine.isNullOrBlank()) {
+                    transferStatusSubtitle?.text = detailLine
+                }
+            }
+        }
+    }
+
+    private fun cancelActiveSync() {
+        runCatching {
+            val decor = activity.window?.decorView as? ViewGroup
+            fun findAndClickCancel(v: View): Boolean {
+                if (v === rootMountContainer) return false
+                if (v is TextView) {
+                    val t = v.text?.toString().orEmpty()
+                    if (t.contains("Остановить синхронизацию", true) || t.contains("Stop sync", true)) {
+                        v.performClick()
+                        return true
+                    }
+                }
+                if (v is ViewGroup) {
+                    for (i in 0 until v.childCount) {
+                        if (findAndClickCancel(v.getChildAt(i))) return true
+                    }
+                }
+                return false
+            }
+            if (decor != null) findAndClickCancel(decor)
+        }
+        runCatching {
+            val f = activity.javaClass.getDeclaredField("downloadCancelledByUser").apply { isAccessible = true }
+            f.setBoolean(activity, true)
+        }
+        runCatching {
+            val m = activity.javaClass.getDeclaredMethod("cancelDownloadSession", String::class.java).apply { isAccessible = true }
+            m.invoke(activity, "Stopped by user")
+        }
+        isByteStreamActive = false
+        transferProgressBar?.visibility = View.GONE
+        transferCancelBtn?.visibility = View.GONE
+        transferStatusTitle?.text = "Ход синхронизации"
+        transferStatusSubtitle?.text = "Синхронизация остановлена пользователем"
+    }
+
+    // ================= УПРАВЛЕНИЕ ДЛИНОЙ ЗАПИСИ ВИДЕО И ОСТАНОВКОЙ В ОЧКАХ =================
+
+    private fun pushVideoDurationToGlasses(seconds: Int) {
+        val minutes = (seconds / 60).coerceAtLeast(1)
+        // 1. Записываем во все возможные SharedPreferences приложения
+        runCatching {
+            val defaultPrefs = activity.getSharedPreferences("${activity.packageName}_preferences", Context.MODE_PRIVATE)
+            listOf(prefs, defaultPrefs, activity.getPreferences(Context.MODE_PRIVATE)).forEach { sp ->
+                sp.edit()
+                    .putInt("video_duration_sec", seconds)
+                    .putInt("video_duration", seconds)
+                    .putInt("record_duration", seconds)
+                    .putInt("video_record_duration", seconds)
+                    .putInt("tunebuds_video_duration", seconds)
+                    .putInt("video_duration_minutes", minutes)
+                    .apply()
+            }
+        }
+
+        // 2. Вызываем методы установки длины видео в TuneBudsManager и MainActivity (если есть)
+        runCatching {
+            val tb = TuneBudsManager.getInstance(activity)
+            for (target in listOf(tb, activity)) {
+                target.javaClass.declaredMethods.forEach { m ->
+                    val name = m.name.lowercase(Locale.ROOT)
+                    if ((name.contains("video") || name.contains("record")) &&
+                        (name.contains("duration") || name.contains("length") || name.contains("limit") || name.contains("time"))
+                    ) {
+                        m.isAccessible = true
+                        val pTypes = m.parameterTypes
+                        if (pTypes.size == 1 && (pTypes[0] == Int::class.javaPrimitiveType || pTypes[0] == Int::class.java)) {
+                            runCatching { m.invoke(target, seconds) }
+                        } else if (pTypes.size == 1 && (pTypes[0] == Long::class.javaPrimitiveType || pTypes[0] == Long::class.java)) {
+                            runCatching { m.invoke(target, seconds.toLong()) }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Передаем настройку длины видео через LargeDataHandler (для протокола HeyCyan / AI Buds)
+        runCatching {
+            val ldhClass = Class.forName("com.oudmon.ble.base.communication.LargeDataHandler")
+            val instance = ldhClass.getMethod("getInstance").invoke(null)
+            ldhClass.declaredMethods.forEach { m ->
+                val name = m.name.lowercase(Locale.ROOT)
+                if (name.contains("video") && (name.contains("duration") || name.contains("time") || name.contains("length"))) {
+                    m.isAccessible = true
+                    if (m.parameterTypes.size == 1 && m.parameterTypes[0] == Int::class.javaPrimitiveType) {
+                        runCatching { m.invoke(instance, seconds) }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun triggerGlassesStopVideo() {
+        var stoppedExplicitly = false
+
+        // 1. Проверяем явный метод остановки видео в TuneBudsManager и MainActivity
+        runCatching {
+            val tb = TuneBudsManager.getInstance(activity)
+            for (target in listOf(tb, activity)) {
+                for (m in target.javaClass.declaredMethods) {
+                    val name = m.name.lowercase(Locale.ROOT)
+                    if ((name == "stopvideo" || name == "stopvideorecording" || name == "stoprecordvideo" || name == "stoprecording") &&
+                        m.parameterTypes.isEmpty()
+                    ) {
+                        m.isAccessible = true
+                        m.invoke(target)
+                        stoppedExplicitly = true
+                        break
+                    }
+                }
+            }
+        }
+
+        // 2. Ищем кнопку остановки видео в стоковом UI (если она отдельная от старта)
+        if (!stoppedExplicitly) {
+            runCatching {
+                val decor = activity.window?.decorView as? ViewGroup
+                fun clickStockStopVideo(v: View): Boolean {
+                    if (v === rootMountContainer) return false
+                    if (v is TextView) {
+                        val t = v.text?.toString().orEmpty().lowercase(Locale.ROOT)
+                        if (t.contains("stop video") || t.contains("остановить видео") || t == "стоп видео") {
+                            v.performClick()
+                            return true
+                        }
+                    }
+                    if (v is ViewGroup) {
+                        for (i in 0 until v.childCount) {
+                            if (clickStockStopVideo(v.getChildAt(i))) return true
+                        }
+                    }
+                    return false
+                }
+                if (decor != null && clickStockStopVideo(decor)) {
+                    stoppedExplicitly = true
+                }
+            }
+        }
+
+        // 3. Если отдельной функции нет — вызываем штатный переключатель onVideoClick()
+        if (!stoppedExplicitly) {
+            releaseStuckCommandSlotIfIdle()
+            onVideoClick()
+        }
     }
 
     // ================= АВТОМОБИЛЬНЫЙ РЕЖИМ (УПРАВЛЕНИЕ ПРОФИЛЕМ A2DP) =================
@@ -603,7 +844,7 @@ class OpenMetaManager(
         pagesFrame.addView(mediaTabContainer)
         mainWrapper.addView(pagesFrame)
 
-        // ПАНЕЛЬ МНОЖЕСТВЕННОГО ВЫБОРА И УДАЛЕНИЯ (появляется при удержании файла)
+        // ПАНЕЛЬ МНОЖЕСТВЕННОГО ВЫБОРА И УДАЛЕНИЯ
         selectionBarOuter = FrameLayout(activity).apply {
             visibility = if (isSelectionMode) View.VISIBLE else View.GONE
             background = roundedBg(bgCard, 0f, strokeSubtle)
@@ -1094,7 +1335,7 @@ class OpenMetaManager(
         updateDurationButtonUi()
         updateRecordButtonVisual()
 
-        // БЛОК НЕДАВНИХ МЕДИА
+        // БЛОК НЕДАВНИХ МЕДИА (по 2 больших превью в ряд)
         val galleryHeader = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -1127,7 +1368,7 @@ class OpenMetaManager(
         val recentCard = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             background = roundedBg(bgCard, 16f, strokeSubtle)
-            setPadding(dp(6), dp(6), dp(6), dp(6))
+            setPadding(dp(8), dp(8), dp(8), dp(8))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -1141,7 +1382,7 @@ class OpenMetaManager(
         return scroll
     }
 
-    // ================= ВКЛАДКА 2: МЕДИА =================
+    // ================= ВКЛАДКА 2: МЕДИА (ПЛАШКА СИНХРОНИЗАЦИИ КАК В СТОКЕ + СЕТКА ПО 2 ПРЕВЬЮ) =================
 
     private fun buildMediaTab(
         dark: Boolean,
@@ -1178,10 +1419,11 @@ class OpenMetaManager(
             setPadding(dp(16), dp(4), dp(16), dp(20))
         }
 
+        // КАРТОЧКА «ХОД СИНХРОНИЗАЦИИ» (точная структура из стока)
         transferBannerCard = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
-            background = roundedBg(bgCard, 16f, strokeSubtle)
-            setPadding(dp(14), dp(14), dp(14), dp(14))
+            background = roundedBg(bgCard, 18f, strokeSubtle)
+            setPadding(dp(16), dp(14), dp(16), dp(14))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -1199,41 +1441,57 @@ class OpenMetaManager(
         }
 
         transferStatusTitle = TextView(activity).apply {
-            text = "Перенос медиа с очков"
+            text = "Ход синхронизации"
             setTextColor(Color.parseColor(textPrimary))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 15f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
             typeface = fontBold
         }
 
-        transferStatusSubtitle = TextView(activity).apply {
-            text = "Нажмите «Перенести» для загрузки. Удерживайте фото или видео для выбора и удаления."
-            setTextColor(Color.parseColor(textSecondary))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setPadding(0, dp(2), dp(8), 0)
+        transferScenarioBadge = TextView(activity).apply {
+            text = "Сценарий: Adaptive flow"
+            setTextColor(Color.parseColor(if (dark) "#A7F3D0" else "#065F46"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            typeface = fontMedium
+            background = roundedBg(if (dark) "#1E3A2F" else "#D1FAE5", 10f)
+            setPadding(dp(10), dp(4), dp(10), dp(4))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(6) }
         }
 
         transferTextCol.addView(transferStatusTitle)
-        transferTextCol.addView(transferStatusSubtitle)
+        transferTextCol.addView(transferScenarioBadge)
 
-        val startSyncBtn = TextView(activity).apply {
+        transferStartBtn = TextView(activity).apply {
             text = "Перенести"
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             typeface = fontMedium
             background = roundedBg(metaBlue, 12f)
-            setPadding(dp(14), dp(9), dp(14), dp(9))
+            setPadding(dp(16), dp(9), dp(16), dp(9))
             setOnClickListener {
                 releaseStuckCommandSlotIfIdle()
                 transferProgressBar?.visibility = View.VISIBLE
                 transferProgressBar?.isIndeterminate = true
-                transferStatusTitle?.text = "Подключение к очкам по Wi-Fi..."
-                transferStatusSubtitle?.text = "Ожидание начала передачи файлов"
+                transferCancelBtn?.visibility = View.VISIBLE
+                transferStatusSubtitle?.text = "Подключение к очкам по Wi-Fi P2P..."
                 onSyncClick()
             }
         }
 
         transferTopRow.addView(transferTextCol)
-        transferTopRow.addView(startSyncBtn)
+        transferTopRow.addView(transferStartBtn)
+        transferBannerCard?.addView(transferTopRow)
+
+        transferCountersText = TextView(activity).apply {
+            text = "Photos: 0/0  Videos: 0/0  Audio: 0/0"
+            setTextColor(Color.parseColor(textPrimary))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            typeface = fontMedium
+            setPadding(0, dp(10), 0, dp(4))
+        }
+        transferBannerCard?.addView(transferCountersText)
 
         transferProgressBar = ProgressBar(activity, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 100
@@ -1241,12 +1499,45 @@ class OpenMetaManager(
             visibility = View.GONE
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                dp(5)
-            ).apply { topMargin = dp(10) }
+                dp(6)
+            ).apply {
+                topMargin = dp(4)
+                bottomMargin = dp(8)
+            }
+        }
+        transferBannerCard?.addView(transferProgressBar)
+
+        val transferBottomRow = LinearLayout(activity).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(4) }
         }
 
-        transferBannerCard?.addView(transferTopRow)
-        transferBannerCard?.addView(transferProgressBar)
+        transferStatusSubtitle = TextView(activity).apply {
+            text = "Нажмите «Перенести» для загрузки новых фото и видео с очков"
+            setTextColor(Color.parseColor(textSecondary))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                rightMargin = dp(8)
+            }
+        }
+
+        transferCancelBtn = TextView(activity).apply {
+            text = "Остановить синхронизацию"
+            setTextColor(Color.parseColor("#F87171"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            typeface = fontBold
+            visibility = View.GONE
+            setPadding(dp(8), dp(6), dp(4), dp(6))
+            setOnClickListener { cancelActiveSync() }
+        }
+
+        transferBottomRow.addView(transferStatusSubtitle)
+        transferBottomRow.addView(transferCancelBtn)
+        transferBannerCard?.addView(transferBottomRow)
         content.addView(transferBannerCard)
 
         val gridHeaderRow = LinearLayout(activity).apply {
@@ -1280,7 +1571,7 @@ class OpenMetaManager(
         val fullGridCard = LinearLayout(activity).apply {
             orientation = LinearLayout.VERTICAL
             background = roundedBg(bgCard, 16f, strokeSubtle)
-            setPadding(dp(6), dp(6), dp(6), dp(6))
+            setPadding(dp(8), dp(8), dp(8), dp(8))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -1302,6 +1593,7 @@ class OpenMetaManager(
         onBytesCopied: ((Long, Long) -> Unit)? = null
     ): File? {
         return try {
+            isByteStreamActive = true
             val ext = if (displayName.endsWith(".mp4", true)) ".mp4" else ".jpg"
             val prefix = if (ext == ".mp4") "VID_" else "IMG_"
             val sdf = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
@@ -1313,8 +1605,9 @@ class OpenMetaManager(
 
             mainHandler.post {
                 transferProgressBar?.visibility = View.VISIBLE
+                transferCancelBtn?.visibility = View.VISIBLE
                 transferProgressBar?.isIndeterminate = contentLength <= 0L
-                transferStatusTitle?.text = "Перенос: $cleanName"
+                transferStatusSubtitle?.text = "Downloading\n$cleanName: 0 KB..."
             }
 
             FileOutputStream(targetFile).use { out ->
@@ -1327,7 +1620,7 @@ class OpenMetaManager(
                     onBytesCopied?.invoke(copiedBytes, contentLength)
 
                     val now = System.currentTimeMillis()
-                    if (now - lastUiUpdateMs > 120L) {
+                    if (now - lastUiUpdateMs > 100L) {
                         lastUiUpdateMs = now
                         updateTransferProgressUi(cleanName, copiedBytes, contentLength)
                     }
@@ -1335,12 +1628,14 @@ class OpenMetaManager(
                 out.flush()
             }
 
+            isByteStreamActive = false
+
             if (copiedBytes <= 0L || (contentLength > 0L && copiedBytes != contentLength)) {
                 targetFile.delete()
                 mainHandler.post {
                     transferProgressBar?.visibility = View.GONE
-                    transferStatusTitle?.text = "Перенос прерван"
-                    transferStatusSubtitle?.text = "Файл передан не полностью, повторите попытку"
+                    transferCancelBtn?.visibility = View.GONE
+                    transferStatusSubtitle?.text = "Перенос прерван, повторите попытку"
                 }
                 return null
             }
@@ -1348,13 +1643,14 @@ class OpenMetaManager(
             targetFile.setLastModified(takenTimeMs)
             mainHandler.post {
                 transferProgressBar?.visibility = View.GONE
-                transferStatusTitle?.text = "Перенос завершен"
+                transferCancelBtn?.visibility = View.GONE
                 val mb = String.format(Locale.US, "%.1f МБ", copiedBytes / (1024f * 1024f))
-                transferStatusSubtitle?.text = "Загружен $cleanName ($mb). Нажмите для 2K-обработки или удерживайте для выбора."
+                transferStatusSubtitle?.text = "Загружен $cleanName ($mb). Нажмите на превью ниже для выбора обработки."
                 refreshAllMediaGrids()
             }
             targetFile
         } catch (e: Exception) {
+            isByteStreamActive = false
             Log.e("OpenMetaSync", "Failed saving incoming file", e)
             null
         }
@@ -1363,23 +1659,24 @@ class OpenMetaManager(
     private fun updateTransferProgressUi(fileName: String, copied: Long, total: Long) {
         mainHandler.post {
             transferProgressBar?.visibility = View.VISIBLE
+            transferCancelBtn?.visibility = View.VISIBLE
             val copiedMb = String.format(Locale.US, "%.1f", copied / (1024f * 1024f))
             if (total > 0L) {
                 val pct = ((copied * 100L) / total).toInt().coerceIn(0, 100)
                 val totalMb = String.format(Locale.US, "%.1f", total / (1024f * 1024f))
                 transferProgressBar?.isIndeterminate = false
+                transferProgressBar?.max = 100
                 transferProgressBar?.progress = pct
-                transferStatusTitle?.text = "Перенос с очков: $pct%"
-                transferStatusSubtitle?.text = "$fileName • $copiedMb из $totalMb МБ"
+                transferStatusSubtitle?.text = "Downloading\n$fileName: $copiedMb / $totalMb МБ ($pct%)"
             } else {
+                val kb = copied / 1024L
                 transferProgressBar?.isIndeterminate = true
-                transferStatusTitle?.text = "Перенос с очков..."
-                transferStatusSubtitle?.text = "$fileName • $copiedMb МБ"
+                transferStatusSubtitle?.text = "Downloading\n$fileName: ${kb} KB..."
             }
         }
     }
 
-    // ================= СЕТКА ПРЕВЬЮ, МНОЖЕСТВЕННЫЙ ВЫБОР ПО УДЕРЖАНИЮ И ПРОСМОТР =================
+    // ================= СЕТКА КРУПНЫХ ПРЕВЬЮ ПО 2 В РЯД И МНОЖЕСТВЕННЫЙ ВЫБОР =================
 
     private data class StagedMediaFile(
         val file: File,
@@ -1485,13 +1782,14 @@ class OpenMetaManager(
 
             withContext(Dispatchers.Main) {
                 activeCellUpdaters.clear()
-                homeContainer?.let { populateGridContainer(it, stagedItems.take(8), thumbs.take(8), cellBg, textSec) }
+                homeContainer?.let { populateGridContainer(it, stagedItems.take(4), thumbs.take(4), cellBg, textSec) }
                 mediaContainer?.let { populateGridContainer(it, stagedItems, thumbs, cellBg, textSec) }
                 syncSelectionUiState()
             }
         }
     }
 
+    // Отрисовка по 2 больших превью в ряд (без пустых серых квадратов)
     private fun populateGridContainer(
         container: LinearLayout,
         items: List<StagedMediaFile>,
@@ -1513,8 +1811,9 @@ class OpenMetaManager(
         }
 
         val effectiveWidth = maxContentWidthPx()
-        val cellSide = ((effectiveWidth - dp(56)) / 4).coerceIn(dp(64), dp(115))
-        val rowCount = (items.size + 3) / 4
+        val cellWidth = ((effectiveWidth - dp(56)) / 2).coerceIn(dp(120), dp(230))
+        val cellHeight = (cellWidth * 0.75f).toInt() // Пропорция 4:3 для крупных превью
+        val rowCount = (items.size + 1) / 2
 
         for (r in 0 until rowCount) {
             val rowLayout = LinearLayout(activity).apply {
@@ -1523,114 +1822,122 @@ class OpenMetaManager(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
                 ).apply {
-                    if (r < rowCount - 1) bottomMargin = dp(4)
+                    if (r < rowCount - 1) bottomMargin = dp(8)
                 }
             }
 
-            for (c in 0..3) {
-                val idx = r * 4 + c
-                val cellFrame = FrameLayout(activity).apply {
-                    layoutParams = LinearLayout.LayoutParams(0, cellSide, 1f).apply {
-                        if (c < 3) rightMargin = dp(4)
+            for (c in 0..1) {
+                val idx = r * 2 + c
+                if (idx >= items.size) {
+                    // Прозрачная распорка вместо пустого серого прямоугольника
+                    val emptySpacer = View(activity).apply {
+                        layoutParams = LinearLayout.LayoutParams(0, cellHeight, 1f).apply {
+                            if (c == 0) rightMargin = dp(8)
+                        }
                     }
-                    background = roundedBg(cellBg, 8f)
+                    rowLayout.addView(emptySpacer)
+                    continue
+                }
+
+                val item = items[idx]
+                val bmp = thumbs[idx]
+                val filePath = item.file.absolutePath
+
+                val cellFrame = FrameLayout(activity).apply {
+                    layoutParams = LinearLayout.LayoutParams(0, cellHeight, 1f).apply {
+                        if (c == 0) rightMargin = dp(8)
+                    }
+                    background = roundedBg(cellBg, 12f)
                     clipToOutline = true
                 }
 
-                if (idx < items.size) {
-                    val item = items[idx]
-                    val bmp = thumbs[idx]
-                    val filePath = item.file.absolutePath
+                val img = ImageView(activity).apply {
+                    layoutParams = FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                    scaleType = ImageView.ScaleType.CENTER_CROP
+                    if (bmp != null) setImageBitmap(bmp)
+                }
+                cellFrame.addView(img)
 
-                    val img = ImageView(activity).apply {
+                if (item.isVideo) {
+                    val totalSec = (item.durationMs / 1000L).coerceAtLeast(1L)
+                    val durBadge = TextView(activity).apply {
+                        text = String.format(Locale.US, "%d:%02d", totalSec / 60L, totalSec % 60L)
+                        setTextColor(Color.WHITE)
+                        setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                        typeface = fontBold
+                        setPadding(dp(7), dp(3), dp(7), dp(3))
+                        background = roundedBg("#B3000000", 6f)
                         layoutParams = FrameLayout.LayoutParams(
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                            ViewGroup.LayoutParams.MATCH_PARENT
-                        )
-                        scaleType = ImageView.ScaleType.CENTER_CROP
-                        if (bmp != null) setImageBitmap(bmp)
-                    }
-                    cellFrame.addView(img)
-
-                    if (item.isVideo) {
-                        val totalSec = (item.durationMs / 1000L).coerceAtLeast(1L)
-                        val durBadge = TextView(activity).apply {
-                            text = String.format(Locale.US, "%d:%02d", totalSec / 60L, totalSec % 60L)
-                            setTextColor(Color.WHITE)
-                            setTextSize(TypedValue.COMPLEX_UNIT_SP, 9f)
-                            typeface = fontMedium
-                            setPadding(dp(4), dp(1), dp(4), dp(1))
-                            background = roundedBg("#99000000", 4f)
-                            layoutParams = FrameLayout.LayoutParams(
-                                ViewGroup.LayoutParams.WRAP_CONTENT,
-                                ViewGroup.LayoutParams.WRAP_CONTENT,
-                                Gravity.BOTTOM or Gravity.END
-                            ).apply {
-                                bottomMargin = dp(3)
-                                rightMargin = dp(3)
-                            }
-                        }
-                        cellFrame.addView(durBadge)
-                    }
-
-                    // Полупрозрачная синяя рамка-заливка при выборе файла
-                    val selectionOverlay = View(activity).apply {
-                        layoutParams = FrameLayout.LayoutParams(
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                            ViewGroup.LayoutParams.MATCH_PARENT
-                        )
-                        background = GradientDrawable().apply {
-                            shape = GradientDrawable.RECTANGLE
-                            cornerRadius = dp(8).toFloat()
-                            setColor(Color.parseColor("#4D0064E0"))
-                            setStroke(dp(2), Color.parseColor("#0064E0"))
-                        }
-                        visibility = View.GONE
-                    }
-                    cellFrame.addView(selectionOverlay)
-
-                    // Векторный чекбокс выбора в правом верхнем углу превью
-                    val checkBadge = SelectionBadgeView(activity).apply {
-                        layoutParams = FrameLayout.LayoutParams(
-                            dp(20),
-                            dp(20),
-                            Gravity.TOP or Gravity.END
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                            Gravity.BOTTOM or Gravity.END
                         ).apply {
-                            topMargin = dp(5)
-                            rightMargin = dp(5)
-                        }
-                        visibility = View.GONE
-                    }
-                    cellFrame.addView(checkBadge)
-
-                    val cellUpdater: () -> Unit = {
-                        val checked = selectedFilePaths.contains(filePath)
-                        checkBadge.visibility = if (isSelectionMode) View.VISIBLE else View.GONE
-                        checkBadge.setCheckedState(checked)
-                        selectionOverlay.visibility = if (isSelectionMode && checked) View.VISIBLE else View.GONE
-                    }
-                    activeCellUpdaters.add(cellUpdater)
-                    cellUpdater.invoke()
-
-                    cellFrame.setOnClickListener {
-                        if (isSelectionMode) {
-                            toggleItemSelection(filePath)
-                        } else {
-                            showMediaPreviewAndProcessDialog(item)
+                            bottomMargin = dp(6)
+                            rightMargin = dp(6)
                         }
                     }
+                    cellFrame.addView(durBadge)
+                }
 
-                    cellFrame.setOnLongClickListener {
-                        if (!isSelectionMode) {
-                            isSelectionMode = true
-                            selectedFilePaths.add(filePath)
-                            syncSelectionUiState()
-                        } else {
-                            toggleItemSelection(filePath)
-                        }
-                        true
+                val selectionOverlay = View(activity).apply {
+                    layoutParams = FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                    background = GradientDrawable().apply {
+                        shape = GradientDrawable.RECTANGLE
+                        cornerRadius = dp(12).toFloat()
+                        setColor(Color.parseColor("#4D0064E0"))
+                        setStroke(dp(2), Color.parseColor("#0064E0"))
+                    }
+                    visibility = View.GONE
+                }
+                cellFrame.addView(selectionOverlay)
+
+                val checkBadge = SelectionBadgeView(activity).apply {
+                    layoutParams = FrameLayout.LayoutParams(
+                        dp(22),
+                        dp(22),
+                        Gravity.TOP or Gravity.END
+                    ).apply {
+                        topMargin = dp(7)
+                        rightMargin = dp(7)
+                    }
+                    visibility = View.GONE
+                }
+                cellFrame.addView(checkBadge)
+
+                val cellUpdater: () -> Unit = {
+                    val checked = selectedFilePaths.contains(filePath)
+                    checkBadge.visibility = if (isSelectionMode) View.VISIBLE else View.GONE
+                    checkBadge.setCheckedState(checked)
+                    selectionOverlay.visibility = if (isSelectionMode && checked) View.VISIBLE else View.GONE
+                }
+                activeCellUpdaters.add(cellUpdater)
+                cellUpdater.invoke()
+
+                cellFrame.setOnClickListener {
+                    if (isSelectionMode) {
+                        toggleItemSelection(filePath)
+                    } else {
+                        showMediaPreviewAndProcessDialog(item)
                     }
                 }
+
+                cellFrame.setOnLongClickListener {
+                    if (!isSelectionMode) {
+                        isSelectionMode = true
+                        selectedFilePaths.add(filePath)
+                        syncSelectionUiState()
+                    } else {
+                        toggleItemSelection(filePath)
+                    }
+                    true
+                }
+
                 rowLayout.addView(cellFrame)
             }
             container.addView(rowLayout)
@@ -1663,10 +1970,12 @@ class OpenMetaManager(
         }
     }
 
+    // ================= ОКНО ПРЕДПРОСМОТРА: СНАЧАЛА ВЫБОР РЕЖИМА (СИНЯЯ ПОДСВЕТКА), ЗАТЕМ «СОХРАНИТЬ» =================
+
     private fun showMediaPreviewAndProcessDialog(item: StagedMediaFile) {
         val dark = isDarkMode
         val bgDialog = if (dark) "#151821" else "#FFFFFF"
-        val bgSecondaryBtn = if (dark) "#222734" else "#F3F4F6"
+        val bgUnselected = if (dark) "#222734" else "#F3F4F6"
         val textPrimary = if (dark) "#F3F4F6" else "#111827"
         val textSecondary = if (dark) "#9CA3AF" else "#6B7280"
         val strokeSubtle = if (dark) "#282E3D" else "#E5E7EB"
@@ -1729,10 +2038,10 @@ class OpenMetaManager(
         root.addView(previewFrame)
 
         val renderStatusText = TextView(activity).apply {
-            text = if (item.isVideo) "Выберите режим обработки перед сохранением в Галерею:" else "Сохранение фото в Галерею:"
+            text = "1. Выберите режим обработки, затем нажмите «Сохранить в Галерею»:"
             setTextColor(Color.parseColor(textSecondary))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setPadding(0, 0, 0, dp(6))
+            setPadding(0, 0, 0, dp(8))
         }
         root.addView(renderStatusText)
 
@@ -1746,76 +2055,142 @@ class OpenMetaManager(
         }
         root.addView(renderProgress)
 
-        fun actionButton(label: String, isPrimary: Boolean, isDanger: Boolean = false, onClick: () -> Unit): TextView {
-            val bg = when {
-                isPrimary -> metaBlue
-                isDanger -> if (dark) "#2D161B" else "#FEE2E2"
-                else -> bgSecondaryBtn
+        var chosenVideoMode: OpenMetaRenderMode = currentRenderMode
+        var chosenPhotoEnhance: Boolean = true
+        val modeOptionViews = mutableListOf<Pair<Int, TextView>>()
+
+        fun refreshModeButtonsSelection(selectedId: Int) {
+            modeOptionViews.forEach { (id, tv) ->
+                val isSelected = (id == selectedId)
+                if (isSelected) {
+                    tv.setTextColor(Color.WHITE)
+                    tv.typeface = fontBold
+                    tv.background = roundedBg(metaBlue, 12f)
+                } else {
+                    tv.setTextColor(Color.parseColor(textPrimary))
+                    tv.typeface = fontMedium
+                    tv.background = roundedBg(bgUnselected, 12f, strokeSubtle)
+                }
             }
-            val txtCol = when {
-                isPrimary -> "#FFFFFF"
-                isDanger -> "#EF4444"
-                else -> textPrimary
-            }
-            return TextView(activity).apply {
+        }
+
+        fun createSelectableModeButton(id: Int, label: String, onSelect: () -> Unit): TextView {
+            val tv = TextView(activity).apply {
                 text = label
                 gravity = Gravity.CENTER
-                setTextColor(Color.parseColor(txtCol))
                 setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-                typeface = fontMedium
-                background = roundedBg(bg, 12f)
                 setPadding(dp(12), dp(11), dp(12), dp(11))
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.WRAP_CONTENT
                 ).apply { bottomMargin = dp(6) }
-                setOnClickListener { onClick() }
+                setOnClickListener {
+                    if (!isRenderingVideo) {
+                        onSelect()
+                        refreshModeButtonsSelection(id)
+                    }
+                }
             }
+            modeOptionViews.add(id to tv)
+            return tv
         }
 
         if (item.isVideo) {
-            root.addView(actionButton("Обработать в Meta 2K (Стабилизация + Резкость)", isPrimary = true) {
-                runVideoProcessingAndExport(item.file, OpenMetaRenderMode.META_FAST_2K, renderStatusText, renderProgress, dialog)
-            })
-            root.addView(actionButton("Горизонт Lock 2K (Удержание горизонта)", isPrimary = false) {
-                runVideoProcessingAndExport(item.file, OpenMetaRenderMode.HORIZON_LOCK_2K, renderStatusText, renderProgress, dialog)
-            })
-            root.addView(actionButton("Сохранить оригинал без обработки", isPrimary = false) {
-                runVideoProcessingAndExport(item.file, OpenMetaRenderMode.RAW_ORIGINAL, renderStatusText, renderProgress, dialog)
-            })
+            val modesOrder = listOf(
+                OpenMetaRenderMode.META_FAST_2K,
+                OpenMetaRenderMode.HORIZON_LOCK_2K,
+                OpenMetaRenderMode.RAW_ORIGINAL
+            )
+            modesOrder.forEach { mode ->
+                root.addView(createSelectableModeButton(mode.id, mode.title) {
+                    chosenVideoMode = mode
+                    currentRenderMode = mode
+                    renderStatusText.text = "Выбран режим: ${mode.title}"
+                })
+            }
+            refreshModeButtonsSelection(chosenVideoMode.id)
         } else {
-            root.addView(actionButton("Сохранить с улучшением цвета и резкости", isPrimary = true) {
-                exportPhotoToGallery(item.file, enhance = true, dialog)
+            root.addView(createSelectableModeButton(1, "Улучшение цвета и резкости") {
+                chosenPhotoEnhance = true
+                renderStatusText.text = "Выбран режим: Улучшение цвета и резкости"
             })
-            root.addView(actionButton("Сохранить оригинал без обработки", isPrimary = false) {
-                exportPhotoToGallery(item.file, enhance = false, dialog)
+            root.addView(createSelectableModeButton(0, "Оригинал без обработки") {
+                chosenPhotoEnhance = false
+                renderStatusText.text = "Выбран режим: Оригинал без обработки"
             })
+            refreshModeButtonsSelection(1)
         }
+
+        // Отдельная кнопка подтверждения «Сохранить в Галерею»
+        val saveConfirmBtn = TextView(activity).apply {
+            text = "Сохранить в Галерею"
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            typeface = fontBold
+            background = roundedBg("#16A34A", 12f)
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply {
+                topMargin = dp(4)
+                bottomMargin = dp(8)
+            }
+            setOnClickListener {
+                if (item.isVideo) {
+                    runVideoProcessingAndExport(item.file, chosenVideoMode, renderStatusText, renderProgress, this, dialog)
+                } else {
+                    exportPhotoToGallery(item.file, chosenPhotoEnhance, dialog)
+                }
+            }
+        }
+        root.addView(saveConfirmBtn)
 
         val bottomRow = LinearLayout(activity).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(2) }
+            )
         }
 
-        val deleteBtn = actionButton("Удалить", isPrimary = false, isDanger = true) {
-            runCatching { videoViewRef?.stopPlayback() }
-            thumbnailCache.remove(item.file.absolutePath)
-            item.file.delete()
-            dialog.dismiss()
-            refreshAllMediaGrids()
-            Toast.makeText(activity, "Файл удален", Toast.LENGTH_SHORT).show()
-        }.apply {
+        val deleteBtn = TextView(activity).apply {
+            text = "Удалить"
+            gravity = Gravity.CENTER
+            setTextColor(Color.parseColor("#EF4444"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            typeface = fontMedium
+            background = roundedBg(if (dark) "#2D161B" else "#FEE2E2", 12f)
+            setPadding(dp(12), dp(11), dp(12), dp(11))
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(5) }
+            setOnClickListener {
+                if (!isRenderingVideo) {
+                    runCatching { videoViewRef?.stopPlayback() }
+                    thumbnailCache.remove(item.file.absolutePath)
+                    item.file.delete()
+                    dialog.dismiss()
+                    refreshAllMediaGrids()
+                    Toast.makeText(activity, "Файл удален", Toast.LENGTH_SHORT).show()
+                }
+            }
         }
 
-        val closeBtn = actionButton("Закрыть", isPrimary = false) {
-            runCatching { videoViewRef?.stopPlayback() }
-            dialog.dismiss()
-        }.apply {
+        val closeBtn = TextView(activity).apply {
+            text = "Закрыть"
+            gravity = Gravity.CENTER
+            setTextColor(Color.parseColor(textPrimary))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            typeface = fontMedium
+            background = roundedBg(bgUnselected, 12f, strokeSubtle)
+            setPadding(dp(12), dp(11), dp(12), dp(11))
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(5) }
+            setOnClickListener {
+                if (!isRenderingVideo) {
+                    runCatching { videoViewRef?.stopPlayback() }
+                    dialog.dismiss()
+                }
+            }
         }
 
         bottomRow.addView(deleteBtn)
@@ -1835,12 +2210,16 @@ class OpenMetaManager(
         mode: OpenMetaRenderMode,
         statusLabel: TextView,
         progressBar: ProgressBar,
+        saveBtn: TextView,
         dialog: Dialog
     ) {
         if (isRenderingVideo) return
         isRenderingVideo = true
+        saveBtn.isEnabled = false
+        saveBtn.alpha = 0.5f
+        saveBtn.text = "Обработка..."
         progressBar.visibility = View.VISIBLE
-        statusLabel.text = "Выполняется обработка: ${mode.title}..."
+        statusLabel.text = "Выполняется: ${mode.title}..."
 
         scope.launch(Dispatchers.IO) {
             val processed = if (mode == OpenMetaRenderMode.RAW_ORIGINAL) {
@@ -1863,6 +2242,9 @@ class OpenMetaManager(
             withContext(Dispatchers.Main) {
                 isRenderingVideo = false
                 progressBar.visibility = View.GONE
+                saveBtn.isEnabled = true
+                saveBtn.alpha = 1f
+                saveBtn.text = "Сохранить в Галерею"
                 if (savedUri != null) {
                     Toast.makeText(activity, "Сохранено в Галерею: $exportName", Toast.LENGTH_LONG).show()
                     dialog.dismiss()
@@ -1990,6 +2372,7 @@ class OpenMetaManager(
             .setTitle("Длительность записи видео")
             .setSingleChoiceItems(titles, checked) { d, which ->
                 selectedVideoDurationSec = seconds[which]
+                Toast.makeText(activity, "Установлен лимит: ${titles[which]}", Toast.LENGTH_SHORT).show()
                 d.dismiss()
             }
             .setNegativeButton("Закрыть", null)
@@ -1997,14 +2380,16 @@ class OpenMetaManager(
     }
 
     private fun startVideoRecordingWithTimer() {
+        pushVideoDurationToGlasses(selectedVideoDurationSec)
         releaseStuckCommandSlotIfIdle()
         onVideoClick()
         isRecordingVideo = true
+        elapsedSegmentSec = 0
         updateRecordButtonVisual()
 
         val totalMs = selectedVideoDurationSec * 1000L
         activeVideoTimer?.cancel()
-        activeVideoTimer = object : CountDownTimer(totalMs, 500L) {
+        activeVideoTimer = object : CountDownTimer(totalMs, 1000L) {
             override fun onTick(millisUntilFinished: Long) {
                 val secLeft = (millisUntilFinished / 1000L).coerceAtLeast(0L)
                 val minPart = secLeft / 60L
@@ -2017,6 +2402,19 @@ class OpenMetaManager(
                 )
                 val progress = ((millisUntilFinished * 1000L) / totalMs).toInt().coerceIn(0, 1000)
                 recordingProgressBar?.progress = progress
+
+                // Если выбран лимит 6/9/12 минут, а прошивка очков отсекает сегмент на 180 секундах (3:00),
+                // автоматически запускаем следующий сегмент
+                elapsedSegmentSec++
+                if (selectedVideoDurationSec > 180 && elapsedSegmentSec >= 180 && secLeft > 5L) {
+                    elapsedSegmentSec = 0
+                    mainHandler.postDelayed({
+                        if (isRecordingVideo) {
+                            releaseStuckCommandSlotIfIdle()
+                            onVideoClick()
+                        }
+                    }, 600L)
+                }
             }
 
             override fun onFinish() {
@@ -2029,10 +2427,10 @@ class OpenMetaManager(
         activeVideoTimer?.cancel()
         activeVideoTimer = null
         if (isRecordingVideo) {
-            releaseStuckCommandSlotIfIdle()
-            onVideoClick()
+            triggerGlassesStopVideo()
         }
         isRecordingVideo = false
+        elapsedSegmentSec = 0
         updateRecordButtonVisual()
     }
 
@@ -2525,7 +2923,6 @@ class OpenMetaManager(
         }
 }
 
-// Векторный индикатор выбора файла на превью (кружок с галочкой)
 class SelectionBadgeView(context: Context) : View(context) {
     private var checked = false
     private val bgFillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
